@@ -17,6 +17,7 @@ var playerLastZ map[string]float32 = make(map[string]float32)
 func checkError(err error) {
 	if err != nil {
 		ilog.ErrorLogger.Println(err.Error())
+		panic(err)
 	}
 }
 
@@ -35,6 +36,14 @@ func parsePlayerInitFrame(player *common.Player) {
 	delete(encoder.PlayerFramesMap, player.Name)
 
 	playerLastZ[player.Name] = float32(player.Position().Z)
+
+	// 记录玩家初始化信息
+	teamName := "T"
+	if player.Team == common.TeamCounterTerrorists {
+		teamName = "CT"
+	}
+	ilog.InfoLogger.Printf("  初始化玩家: %s (%s) at (%.1f, %.1f, %.1f)",
+		player.Name, teamName, player.Position().X, player.Position().Y, player.Position().Z)
 }
 
 func normalizeDegree(degree float64) float64 {
@@ -62,6 +71,12 @@ func parsePlayerFrame(player *common.Player, addonButton int32, tickrate float64
 	iFrameInfo.ActualVelocity[2] = float32(player.Velocity().Z)
 	iFrameInfo.PredictedAngles[0] = player.ViewDirectionY()
 	iFrameInfo.PredictedAngles[1] = player.ViewDirectionX()
+
+	// 每帧都记录位置
+	iFrameInfo.Origin[0] = float32(player.Position().X)
+	iFrameInfo.Origin[1] = float32(player.Position().Y)
+	iFrameInfo.Origin[2] = float32(player.Position().Z)
+
 	iFrameInfo.PlayerImpulse = 0
 	iFrameInfo.PlayerSeed = 0
 	iFrameInfo.PlayerSubtype = 0
@@ -84,16 +99,13 @@ func parsePlayerFrame(player *common.Player, addonButton int32, tickrate float64
 	}
 
 	lastIdx := len(encoder.PlayerFramesMap[player.Name]) - 1
-	// addons
-	if fullsnap || (lastIdx < 2000 && (lastIdx+1)%int(tickrate) == 0) || (lastIdx >= 2000 && (lastIdx+1)%int(tickrate) == 0) {
-		// if false {
+	// addons - 在冻结时间或每2秒添加关键帧
+	if fullsnap || (lastIdx+1)%int(tickrate*2) == 0 {
 		iFrameInfo.AdditionalFields |= encoder.FIELDS_ORIGIN
 		iFrameInfo.AtOrigin[0] = float32(player.Position().X)
 		iFrameInfo.AtOrigin[1] = float32(player.Position().Y)
 		iFrameInfo.AtOrigin[2] = float32(player.Position().Z)
-		// iFrameInfo.AdditionalFields |= encoder.FIELDS_ANGLES
-		// iFrameInfo.AtAngles[0] = float32(player.ViewDirectionY())
-		// iFrameInfo.AtAngles[1] = float32(player.ViewDirectionX())
+
 		iFrameInfo.AdditionalFields |= encoder.FIELDS_VELOCITY
 		iFrameInfo.AtVelocity[0] = float32(player.Velocity().X)
 		iFrameInfo.AtVelocity[1] = float32(player.Velocity().Y)
@@ -147,16 +159,16 @@ func parsePlayerFrame(player *common.Player, addonButton int32, tickrate float64
 				_preVel[0] = 450.0 // front
 			}
 		}
-
 	}
 
 	encoder.PlayerFramesMap[player.Name] = append(encoder.PlayerFramesMap[player.Name], *iFrameInfo)
 }
 
 func saveToRecFile(player *common.Player, roundNum int32) {
-	if player.Team == common.TeamTerrorists {
-		encoder.WriteToRecFile(player.Name, roundNum, "t")
-	} else {
-		encoder.WriteToRecFile(player.Name, roundNum, "ct")
+	teamSuffix := "t"
+	if player.Team == common.TeamCounterTerrorists {
+		teamSuffix = "ct"
 	}
+
+	encoder.WriteToRecFile(player.Name, roundNum, teamSuffix)
 }

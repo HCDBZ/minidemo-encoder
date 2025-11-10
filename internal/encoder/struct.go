@@ -13,6 +13,7 @@ type FrameInfo struct {
 	ActualVelocity    [3]float32
 	PredictedVelocity [3]float32
 	PredictedAngles   [2]float32
+	Origin            [3]float32 
 	CSWeaponID        int32
 	PlayerSubtype     int32
 	PlayerSeed        int32

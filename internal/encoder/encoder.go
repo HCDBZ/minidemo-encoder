@@ -2,8 +2,8 @@ package encoder
 
 import (
 	"bytes"
+	"fmt"
 	"os"
-	"strconv"
 	"time"
 
 	ilog "github.com/hx-w/minidemo-encoder/internal/logger"
@@ -23,9 +23,21 @@ var saveDir string = "./output"
 func init() {
 	if ok, _ := PathExists(saveDir); !ok {
 		os.Mkdir(saveDir, os.ModePerm)
-		ilog.InfoLogger.Println("未找到保存目录，已创建：", saveDir)
-	} else {
-		ilog.InfoLogger.Println("保存目录存在：", saveDir)
+		ilog.InfoLogger.Println("创建输出目录：", saveDir)
+	}
+}
+
+// SetSaveDir 设置输出目录
+func SetSaveDir(dir string) {
+	saveDir = dir
+	// 确保目录存在
+	if ok, _ := PathExists(saveDir); !ok {
+		err := os.MkdirAll(saveDir, os.ModePerm)
+		if err != nil {
+			ilog.ErrorLogger.Println("创建输出目录失败:", err.Error())
+		} else {
+			ilog.InfoLogger.Println("创建输出目录：", saveDir)
+		}
 	}
 }
 
@@ -59,18 +71,26 @@ func InitPlayer(initFrame FrameInitInfo) {
 	for idx := 0; idx < 2; idx++ {
 		WriteToBuf(initFrame.PlayerName, initFrame.Angles[idx])
 	}
-	// ilog.InfoLogger.Println("初始化成功: ", initFrame.PlayerName)
 }
 
-func WriteToRecFile(playerName string, roundNum int32, subdir string) {
-	subDir := saveDir + "/round" + strconv.Itoa(int(roundNum)) + "/" + subdir
-	if ok, _ := PathExists(subDir); !ok {
-		os.MkdirAll(subDir, os.ModePerm)
+func WriteToRecFile(playerName string, roundNum int32, teamSide string) {
+	// 新的目录结构：output/demo名称/round1/t/ 或 output/demo名称/round1/ct/
+	roundDir := fmt.Sprintf("%s/round%d", saveDir, roundNum)
+	teamDir := fmt.Sprintf("%s/%s", roundDir, teamSide)
+
+	// 确保目录存在
+	if ok, _ := PathExists(teamDir); !ok {
+		err := os.MkdirAll(teamDir, os.ModePerm)
+		if err != nil {
+			ilog.ErrorLogger.Println("创建目录失败:", err.Error())
+			return
+		}
 	}
-	fileName := subDir + "/" + playerName + ".rec"
-	file, err := os.Create(fileName) // 创建文件, "binbin"是文件名字
+
+	fileName := fmt.Sprintf("%s/%s.rec", teamDir, playerName)
+	file, err := os.Create(fileName)
 	if err != nil {
-		ilog.ErrorLogger.Println("文件创建失败", err.Error())
+		ilog.ErrorLogger.Println("文件创建失败:", err.Error())
 		return
 	}
 	defer file.Close()
@@ -89,19 +109,32 @@ func WriteToRecFile(playerName string, roundNum int32, subdir string) {
 	for _, frame := range PlayerFramesMap[playerName] {
 		WriteToBuf(playerName, frame.PlayerButtons)
 		WriteToBuf(playerName, frame.PlayerImpulse)
+
+		// ActualVelocity (3 floats)
 		for idx := 0; idx < 3; idx++ {
 			WriteToBuf(playerName, frame.ActualVelocity[idx])
 		}
+
+		// PredictedVelocity (3 floats)
 		for idx := 0; idx < 3; idx++ {
 			WriteToBuf(playerName, frame.PredictedVelocity[idx])
 		}
+
+		// PredictedAngles (2 floats)
 		for idx := 0; idx < 2; idx++ {
 			WriteToBuf(playerName, frame.PredictedAngles[idx])
 		}
+
+		// Origin (3 floats)
+		for idx := 0; idx < 3; idx++ {
+			WriteToBuf(playerName, frame.Origin[idx])
+		}
+
 		WriteToBuf(playerName, frame.CSWeaponID)
 		WriteToBuf(playerName, frame.PlayerSubtype)
 		WriteToBuf(playerName, frame.PlayerSeed)
 		WriteToBuf(playerName, frame.AdditionalFields)
+
 		// 附加信息
 		if frame.AdditionalFields&FIELDS_ORIGIN != 0 {
 			for idx := 0; idx < 3; idx++ {
@@ -120,7 +153,20 @@ func WriteToRecFile(playerName string, roundNum int32, subdir string) {
 		}
 	}
 
+	// 写入文件
+	_, writeErr := file.Write(bufMap[playerName].Bytes())
+	if writeErr != nil {
+		ilog.ErrorLogger.Printf("写入文件失败 [%s]: %s\n", fileName, writeErr.Error())
+		return
+	}
+
+	// 清理内存
 	delete(PlayerFramesMap, playerName)
-	file.Write(bufMap[playerName].Bytes())
-	ilog.InfoLogger.Printf("[第%d回合] 选手录像保存成功: %s.rec\n", roundNum, playerName)
+
+	// 输出更简洁的日志
+	teamName := "T"
+	if teamSide == "ct" {
+		teamName = "CT"
+	}
+	ilog.InfoLogger.Printf("    ✓ %s (%s) - %d 帧", playerName, teamName, tickCount)
 }

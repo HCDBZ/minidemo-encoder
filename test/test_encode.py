@@ -9,7 +9,7 @@ FIELDS_ORIGIN = 1 << 0
 FIELDS_ANGLES = 1 << 1
 FIELDS_VELOCITY = 1 << 2
 
-with open('output/round4/s1mple.rec', 'rb') as iFile:
+with open('output/round1/ct/player.rec', 'rb') as iFile:
     # Step 1: valid check
     _buffer = iFile.read(4)
     assert _buffer == __MAGIC__
@@ -55,7 +55,7 @@ with open('output/round4/s1mple.rec', 'rb') as iFile:
     totalTick, = struct.unpack('i', _buffer)
     print(f'totalTick: {totalTick}')
 
-    # Step 9: total bookmark(no need)
+    # Step 9: total bookmark
     _buffer = iFile.read(4)
     totalBM, = struct.unpack('i', _buffer)
     print(f'totalBM: {totalBM}')
@@ -64,25 +64,38 @@ with open('output/round4/s1mple.rec', 'rb') as iFile:
     for bookmark in range(totalBM):
         _buffer = iFile.read(4)  # frame
         _buffer = iFile.read(4)  # additionalTeleportTick
-        _buffer = iFile.read(64) # bookmark name, length defined by botmimic: MAX_BOOKMARK_NAME_LENGTH
+        _buffer = iFile.read(64) # bookmark name
 
     # Step 11: read all tick
     for tick in range(totalTick):
-        # read 14 items(4bytes each)
+        # read items
         _buffer = iFile.read(4)
         playerButtons, = struct.unpack('i', _buffer)
         _buffer = iFile.read(4)
         playerImpulse, = struct.unpack('i', _buffer)
-        actVel, predictVel, predictAng = [], [], []
+        
+        actVel, predictVel, predictAng, origin = [], [], [], []
+        
+        # ActualVelocity (3 floats)
         for idx in range(3):
             _buffer = iFile.read(4)
             actVel.append(struct.unpack('f', _buffer)[0])
+        
+        # PredictedVelocity (3 floats)
         for idx in range(3):
             _buffer = iFile.read(4)
             predictVel.append(struct.unpack('f', _buffer)[0])
+        
+        # PredictedAngles (2 floats)
         for idx in range(2):
             _buffer = iFile.read(4)
             predictAng.append(struct.unpack('f', _buffer)[0])
+        
+        # Origin (3 floats) 
+        for idx in range(3):
+            _buffer = iFile.read(4)
+            origin.append(struct.unpack('f', _buffer)[0])
+        
         _buffer = iFile.read(4)
         newWeapon, = struct.unpack('i', _buffer)
         _buffer = iFile.read(4)
@@ -92,33 +105,30 @@ with open('output/round4/s1mple.rec', 'rb') as iFile:
         _buffer = iFile.read(4)
         addFields, = struct.unpack('i', _buffer)
         
-        #if addFields & (FIELDS_ORIGIN | FIELDS_ANGLES | FIELDS_VELOCITY):
-        # if newWeapon != 0:
-        if playerButtons & (1 << 1):
-            print(f'tick: {tick}')
+        if tick < 10:
+            print(f'\n=== Tick {tick} ===')
+            print(f'origin: {origin}')
             print(f'playerButtons: {playerButtons}')
-            print(f'playerImpulse: {playerImpulse}')
             print(f'actVel: {actVel}')
             print(f'predictVel: {predictVel}')
             print(f'predictAng: {predictAng}')
             print(f'newWeapon: {newWeapon}')
-            print(f'playerSubtype: {playerSubtype}')
-            print(f'playerSeed: {playerSeed}')
             print(f'addFields: {addFields}')
-            print()
 
-        if (addFields &  FIELDS_ORIGIN):
+        if (addFields & FIELDS_ORIGIN):
             nowOrigin = []
             for idx in range(3):
                 _buffer = iFile.read(4)
                 nowOrigin.append(struct.unpack('f', _buffer)[0])
-        if (addFields &  FIELDS_ANGLES):
+        if (addFields & FIELDS_ANGLES):
             nowAngle = []
             for idx in range(3):
                 _buffer = iFile.read(4)
                 nowAngle.append(struct.unpack('f', _buffer)[0])
-        if (addFields &  FIELDS_VELOCITY):
+        if (addFields & FIELDS_VELOCITY):
             nowVelocity = []
             for idx in range(3):
                 _buffer = iFile.read(4)
                 nowVelocity.append(struct.unpack('f', _buffer)[0])
+    
+    print(f'\n文件读取成功！共 {totalTick} 帧')

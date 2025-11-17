@@ -54,6 +54,34 @@ type PlayerInfo struct {
 
 var allPlayersInfo map[string]*PlayerInfo
 
+// 辅助函数：初始化玩家到正确的队伍，避免重复
+func initializePlayerInRound(player *common.Player, roundPurchases *RoundPurchaseData) {
+	if player == nil || roundPurchases == nil {
+		return
+	}
+
+	playerName := player.Name
+
+	// 关键：先从两个队伍中都移除该玩家（避免重复）
+	delete(roundPurchases.T, playerName)
+	delete(roundPurchases.CT, playerName)
+
+	// 然后根据当前队伍添加到正确的位置
+	var teamMap map[string]*PlayerPurchaseData
+	if player.Team == common.TeamTerrorists {
+		teamMap = roundPurchases.T
+	} else if player.Team == common.TeamCounterTerrorists {
+		teamMap = roundPurchases.CT
+	}
+
+	if teamMap != nil {
+		teamMap[playerName] = &PlayerPurchaseData{
+			Purchases:      []PurchaseRecord{},
+			FinalInventory: []string{},
+		}
+	}
+}
+
 // 武器变化检测函数
 func detectWeaponChanges(player *common.Player, currentTick int, buttonTickMap map[TickPlayer]int32, playerLastWeapons map[uint64][]string) {
 	if player == nil {
@@ -187,22 +215,8 @@ func Start(filePath string) {
 						recordPlayerStartMoney(player, roundNum)
 						recordPlayerInfo(player)
 
-						var teamMap map[string]*PlayerPurchaseData
-						if player.Team == common.TeamTerrorists {
-							teamMap = currentRoundPurchases.T
-						} else if player.Team == common.TeamCounterTerrorists {
-							teamMap = currentRoundPurchases.CT
-						}
-
-						if teamMap != nil {
-							playerName := player.Name
-							if _, exists := teamMap[playerName]; !exists {
-								teamMap[playerName] = &PlayerPurchaseData{
-									Purchases:      []PurchaseRecord{},
-									FinalInventory: []string{},
-								}
-							}
-						}
+						// 使用新的初始化函数
+						initializePlayerInRound(player, currentRoundPurchases)
 					}
 				}
 
@@ -314,9 +328,13 @@ func Start(filePath string) {
 
 		playerName := e.Player.Name
 		if _, exists := teamMap[playerName]; !exists {
-			teamMap[playerName] = &PlayerPurchaseData{
-				Purchases:      []PurchaseRecord{},
-				FinalInventory: []string{},
+			// 使用新的初始化函数确保玩家只在一个队伍
+			initializePlayerInRound(e.Player, currentRoundPurchases)
+			// 重新获取 teamMap
+			if e.Player.Team == common.TeamTerrorists {
+				teamMap = currentRoundPurchases.T
+			} else {
+				teamMap = currentRoundPurchases.CT
 			}
 		}
 
@@ -384,9 +402,13 @@ func Start(filePath string) {
 
 		playerName := e.Player.Name
 		if _, exists := teamMap[playerName]; !exists {
-			teamMap[playerName] = &PlayerPurchaseData{
-				Purchases:      []PurchaseRecord{},
-				FinalInventory: []string{},
+			// 使用新的初始化函数确保玩家只在一个队伍
+			initializePlayerInRound(e.Player, currentRoundPurchases)
+			// 重新获取 teamMap
+			if e.Player.Team == common.TeamTerrorists {
+				teamMap = currentRoundPurchases.T
+			} else {
+				teamMap = currentRoundPurchases.CT
 			}
 		}
 
@@ -502,7 +524,7 @@ func Start(filePath string) {
 			buttonTickMap[key] = IN_USE
 		}
 
-		ilog.InfoLogger.Printf("  [种弹开始] %s 开始种弹 (Tick: %d)",
+		ilog.InfoLogger.Printf("  [埋弹开始] %s 开始埋弹 (Tick: %d)",
 			e.Player.Name, currentTick)
 	})
 
@@ -514,7 +536,7 @@ func Start(filePath string) {
 		gs := iParser.GameState()
 		currentTick := gs.IngameTick()
 
-		ilog.InfoLogger.Printf("  [种弹中止] %s (Tick: %d)",
+		ilog.InfoLogger.Printf("  [埋弹中止] %s (Tick: %d)",
 			e.Player.Name, currentTick)
 	})
 
@@ -534,7 +556,7 @@ func Start(filePath string) {
 			siteName = "B点"
 		}
 
-		ilog.InfoLogger.Printf("  [种弹完成] %s 成功放置炸弹于 %s (Tick: %d)",
+		ilog.InfoLogger.Printf("  [埋弹完成] %s 成功放置炸弹于 %s (Tick: %d)",
 			e.Player.Name, siteName, currentTick)
 	})
 
@@ -595,22 +617,8 @@ func Start(filePath string) {
 				recordPlayerStartMoney(player, roundNum)
 				recordPlayerInfo(player)
 
-				var teamMap map[string]*PlayerPurchaseData
-				if player.Team == common.TeamTerrorists {
-					teamMap = currentRoundPurchases.T
-				} else if player.Team == common.TeamCounterTerrorists {
-					teamMap = currentRoundPurchases.CT
-				}
-
-				if teamMap != nil {
-					playerName := player.Name
-					if _, exists := teamMap[playerName]; !exists {
-						teamMap[playerName] = &PlayerPurchaseData{
-							Purchases:      []PurchaseRecord{},
-							FinalInventory: []string{},
-						}
-					}
-				}
+				// 使用新的初始化函数
+				initializePlayerInRound(player, currentRoundPurchases)
 			}
 		}
 

@@ -46,6 +46,18 @@ type C4HolderInfo struct {
 
 var allC4Holders []C4HolderInfo
 
+// 聊天消息记录
+type ChatMessage struct {
+	Round      int     `json:"round"`
+	Time       float64 `json:"time"`
+	PlayerName string  `json:"player_name"`
+	Team       string  `json:"team"`
+	Message    string  `json:"message"`
+	IsTeamChat bool    `json:"is_team_chat"`
+}
+
+var allChatMessages []ChatMessage
+
 // 玩家信息记录
 type PlayerInfo struct {
 	SteamID       uint64 `json:"steamid"`
@@ -62,7 +74,7 @@ func initializePlayerInRound(player *common.Player, roundPurchases *RoundPurchas
 
 	playerName := player.Name
 
-	// 关键：先从两个队伍中都移除该玩家（避免重复）
+	// 先从两个队伍中都移除该玩家（避免重复）
 	delete(roundPurchases.T, playerName)
 	delete(roundPurchases.CT, playerName)
 
@@ -165,6 +177,7 @@ func Start(filePath string) {
 
 	allC4Holders = make([]C4HolderInfo, 0)
 	allPlayersInfo = make(map[string]*PlayerInfo)
+	allChatMessages = make([]ChatMessage, 0)
 
 	var buttonTickMap map[TickPlayer]int32 = make(map[TickPlayer]int32)
 	var playerLastScopedState map[uint64]bool = make(map[uint64]bool)
@@ -567,6 +580,60 @@ func Start(filePath string) {
 		}
 	})
 
+	// 聊天消息处理
+	iParser.RegisterEventHandler(func(e events.ChatMessage) {
+		if currentRound == nil || !currentRound.started {
+			return
+		}
+
+		gs := iParser.GameState()
+		currentTick := gs.IngameTick()
+		chatTime := float64(currentTick-currentRound.freezetimeStart) / iParser.TickRate()
+
+		teamName := "Unknown"
+		var sender *common.Player
+
+		allPlayers := append(gs.TeamTerrorists().Members(), gs.TeamCounterTerrorists().Members()...)
+		for _, player := range allPlayers {
+			if player != nil && player.Name == e.Sender.Name {
+				sender = player
+				break
+			}
+		}
+
+		if sender != nil {
+			switch sender.Team {
+			case common.TeamTerrorists:
+				teamName = "T"
+			case common.TeamCounterTerrorists:
+				teamName = "CT"
+			case common.TeamSpectators:
+				teamName = "Spectator"
+			default:
+				teamName = "Unknown"
+			}
+		}
+
+		chatMsg := ChatMessage{
+			Round:      currentRound.roundNum,
+			Time:       chatTime,
+			PlayerName: e.Sender.Name,
+			Team:       teamName,
+			Message:    e.Text,
+			IsTeamChat: !e.IsChatAll,
+		}
+
+		allChatMessages = append(allChatMessages, chatMsg)
+
+		chatType := "全体"
+		if chatMsg.IsTeamChat {
+			chatType = "队伍"
+		}
+
+		ilog.InfoLogger.Printf("  [聊天-%s] 回合%d %.2f秒 - %s (%s): %s",
+			chatType, currentRound.roundNum, chatTime, e.Sender.Name, teamName, e.Text)
+	})
+
 	iParser.RegisterEventHandler(func(e events.RoundStart) {
 		gs := iParser.GameState()
 
@@ -735,6 +802,15 @@ func Start(filePath string) {
 		ilog.ErrorLogger.Printf("保存玩家信息失败: %s\n", err.Error())
 	} else {
 		ilog.InfoLogger.Printf("玩家信息已保存到: %s/players_info.json", outputBaseDir)
+	}
+
+	ilog.InfoLogger.Println("\n开始保存聊天数据...")
+	err = saveChatData()
+	if err != nil {
+		ilog.ErrorLogger.Printf("保存聊天数据失败: %s\n", err.Error())
+	} else {
+		ilog.InfoLogger.Printf("聊天数据已保存到: %s/chat.json", outputBaseDir)
+		ilog.InfoLogger.Printf("共记录 %d 条聊天消息", len(allChatMessages))
 	}
 
 	ilog.InfoLogger.Printf("\n解析完成!所有回合录像已保存到 %s/ 目录", outputBaseDir)
@@ -936,4 +1012,15 @@ func savePlayersInfo() error {
 	}
 
 	return os.WriteFile(playersFile, data, 0644)
+}
+
+func saveChatData() error {
+	chatFile := filepath.Join(outputBaseDir, "chat.json")
+
+	data, err := json.MarshalIndent(allChatMessages, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(chatFile, data, 0644)
 }

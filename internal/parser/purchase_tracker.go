@@ -29,10 +29,10 @@ type PurchaseRecord struct {
 	Action ItemAction `json:"action"` // 动作类型:purchased/picked_up/dropped
 }
 
-// PlayerPurchaseData 玩家购买数据
 type PlayerPurchaseData struct {
-	Purchases      []PurchaseRecord `json:"purchases"`       // 购买/捡起/丢弃记录
-	FinalInventory []string         `json:"final_inventory"` // 回合结束时的装备
+	Purchases             []PurchaseRecord `json:"purchases"`
+	FinalInventory        []string         `json:"final_inventory"`
+	FreezetimeEndGrenades []string         `json:"-"`
 }
 
 // RoundPurchaseData 回合购买数据

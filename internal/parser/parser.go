@@ -20,13 +20,15 @@ type TickPlayer struct {
 }
 
 type RoundInfo struct {
-	roundNum        int
-	freezetimeStart int
-	freezetimeEnd   int
-	roundEnd        int
-	inFreezeTime    bool
-	isHalftime      bool
-	started         bool
+	roundNum           int
+	freezetimeStart    int
+	freezetimeEnd      int
+	roundEnd           int
+	inFreezeTime       bool
+	isHalftime         bool
+	started            bool
+	buyTimeEnd         int
+	inventoryCheckTime int
 }
 
 var allRoundsFreezeInfo []string
@@ -354,6 +356,12 @@ func Start(filePath string) {
 
 				parsePlayerFrame(player, addonButton, iParser.TickRate(), currentRound.inFreezeTime)
 			}
+
+			if currentRound != nil && currentTick == currentRound.inventoryCheckTime {
+				ilog.InfoLogger.Printf("  [装备验证] 回合 %d 延长验证时间到达 (Tick: %d)",
+					currentRound.roundNum, currentTick)
+				recordAllPlayersInventory(&gs, currentRoundPurchases)
+			}
 		}
 	})
 
@@ -473,7 +481,10 @@ func Start(filePath string) {
 			return
 		}
 
-		if !currentRound.inFreezeTime {
+		// 检查是否在购买时间内 (冻结时间+)
+		inBuyTime := currentRound.inFreezeTime || currentTick <= currentRound.buyTimeEnd
+
+		if !inBuyTime {
 			return
 		}
 
@@ -861,11 +872,18 @@ func Start(filePath string) {
 			currentRound.freezetimeEnd = currentTick
 			currentRound.inFreezeTime = false
 
+			// 设置延长时间
+			tickRate := iParser.TickRate()
+			extendTicks := int(tickRate * 10)
+			currentRound.buyTimeEnd = currentTick + extendTicks
+			currentRound.inventoryCheckTime = currentTick + extendTicks
+
 			freezeDuration := getAdjustedTime(currentTick-currentRound.freezetimeStart, iParser.TickRate())
 			ilog.InfoLogger.Printf("回合 %d 冻结时间结束 (Tick: %d, 持续: %.2f秒)",
 				currentRound.roundNum, currentTick, freezeDuration)
+			ilog.InfoLogger.Printf("  购买时间延长至: Tick %d (+10秒)", currentRound.buyTimeEnd)
 
-			recordAllPlayersInventory(&gs, currentRoundPurchases)
+			recordPlayersGrenades(&gs, currentRoundPurchases)
 			detectC4Holder(&gs, currentRound.roundNum)
 		}
 	})
@@ -1205,4 +1223,56 @@ func saveChatData() error {
 	}
 
 	return os.WriteFile(chatFile, data, 0644)
+}
+
+// 只记录玩家的手雷（在冻结时间结束时调用）
+func recordPlayersGrenades(gs *dem.GameState, roundPurchases *RoundPurchaseData) {
+	tPlayers := (*gs).TeamTerrorists().Members()
+	ctPlayers := (*gs).TeamCounterTerrorists().Members()
+	allPlayers := append(tPlayers, ctPlayers...)
+
+	for _, player := range allPlayers {
+		if player == nil {
+			continue
+		}
+
+		var teamMap map[string]*PlayerPurchaseData
+		if player.Team == common.TeamTerrorists {
+			teamMap = roundPurchases.T
+		} else if player.Team == common.TeamCounterTerrorists {
+			teamMap = roundPurchases.CT
+		} else {
+			continue
+		}
+
+		playerName := player.Name
+		if _, exists := teamMap[playerName]; !exists {
+			teamMap[playerName] = &PlayerPurchaseData{
+				Purchases:             []PurchaseRecord{},
+				FinalInventory:        []string{},
+				FreezetimeEndGrenades: []string{}, // 新字段
+			}
+		}
+
+		// 只记录手雷
+		grenades := []string{}
+		for _, weapon := range player.Weapons() {
+			if weapon != nil {
+				weaponName := getEquipmentName(weapon)
+				// 检查是否是手雷
+				switch weapon.Type {
+				case common.EqFlash, common.EqSmoke, common.EqHE,
+					common.EqMolotov, common.EqIncendiary, common.EqDecoy:
+					grenades = append(grenades, weaponName)
+				}
+			}
+		}
+
+		teamMap[playerName].FreezetimeEndGrenades = grenades
+
+		if len(grenades) > 0 {
+			ilog.InfoLogger.Printf("    [道具验证] %s - %s: %v",
+				getTeamName(player.Team), playerName, grenades)
+		}
+	}
 }

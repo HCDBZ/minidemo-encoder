@@ -66,7 +66,7 @@ type PlayerInfo struct {
 
 var allPlayersInfo map[string]*PlayerInfo
 
-// 辅助函数：初始化玩家到正确的队伍，避免重复
+// 初始化玩家到正确的队伍，避免重复
 func initializePlayerInRound(player *common.Player, roundPurchases *RoundPurchaseData) {
 	if player == nil || roundPurchases == nil {
 		return
@@ -192,52 +192,13 @@ func Start(filePath string) {
 	iParser.RegisterEventHandler(func(e events.FrameDone) {
 		gs := iParser.GameState()
 
-		if !firstRoundDetected && !gameStarted {
-			tPlayers := gs.TeamTerrorists().Members()
-			ctPlayers := gs.TeamCounterTerrorists().Members()
-
-			if len(tPlayers) > 0 || len(ctPlayers) > 0 {
-				gameStarted = true
-				firstRoundDetected = true
-				roundNum = 1
-				currentTick := gs.IngameTick()
-
-				currentRound = &RoundInfo{
-					roundNum:        roundNum,
-					freezetimeStart: currentTick,
-					freezetimeEnd:   currentTick,
-					inFreezeTime:    true,
-					isHalftime:      false,
-					started:         false,
-				}
-
-				currentRoundPurchases = &RoundPurchaseData{
-					T:  make(map[string]*PlayerPurchaseData),
-					CT: make(map[string]*PlayerPurchaseData),
-				}
-				allPurchaseData[fmt.Sprintf("round%d", roundNum)] = currentRoundPurchases
-				weaponTracker = NewWeaponTracker()
-
-				ilog.InfoLogger.Printf("====================================")
-				ilog.InfoLogger.Printf("检测到游戏已开始,初始化回合 %d (Tick: %d)", roundNum, currentTick)
-
-				Players := append(tPlayers, ctPlayers...)
-				for _, player := range Players {
-					if player != nil {
-						parsePlayerInitFrame(player)
-						recordPlayerStartMoney(player, roundNum)
-						recordPlayerInfo(player)
-
-						// 使用新的初始化函数
-						initializePlayerInRound(player, currentRoundPurchases)
-					}
-				}
-
-				currentRound.started = true
-			}
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			return
 		}
 
-		if currentRound == nil || !currentRound.started {
+		// 检查游戏是否已开始
+		if !gameStarted || currentRound == nil || !currentRound.started {
 			return
 		}
 
@@ -282,13 +243,18 @@ func Start(filePath string) {
 
 	iParser.RegisterEventHandler(func(e events.ItemDrop) {
 		gs := iParser.GameState()
+
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			return
+		}
+
 		currentTick := gs.IngameTick()
 
 		if e.Player != nil {
 			key := TickPlayer{currentTick, e.Player.SteamID64}
 
 			if e.Weapon != nil {
-				weaponName := getEquipmentName(e.Weapon)
 				weaponType := e.Weapon.Type
 
 				isGrenade := false
@@ -304,11 +270,7 @@ func Start(filePath string) {
 					} else {
 						buttonTickMap[key] = IN_ATTACK
 					}
-					ilog.InfoLogger.Printf("  [投掷] %s 投出 %s (Tick: %d)",
-						e.Player.Name, weaponName, currentTick)
 				} else {
-					ilog.InfoLogger.Printf("  [丢弃] %s 丢弃 %s (Tick: %d)",
-						e.Player.Name, weaponName, currentTick)
 				}
 			}
 		}
@@ -362,6 +324,12 @@ func Start(filePath string) {
 
 	iParser.RegisterEventHandler(func(e events.ItemPickup) {
 		gs := iParser.GameState()
+
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			return
+		}
+
 		currentTick := gs.IngameTick()
 
 		if e.Player != nil && e.Weapon != nil {
@@ -377,8 +345,6 @@ func Start(filePath string) {
 				}
 
 				if currentRound != nil && !currentRound.inFreezeTime {
-					ilog.InfoLogger.Printf("  [捡枪] %s 捡起 %s (Tick: %d)",
-						e.Player.Name, weaponName, currentTick)
 				}
 			}
 		}
@@ -402,7 +368,6 @@ func Start(filePath string) {
 		}
 
 		actionTime := float64(currentTick-currentRound.freezetimeStart) / iParser.TickRate()
-		weaponID := e.Weapon.UniqueID()
 
 		var teamMap map[string]*PlayerPurchaseData
 		if e.Player.Team == common.TeamTerrorists {
@@ -426,7 +391,6 @@ func Start(filePath string) {
 		}
 
 		var action ItemAction
-		var logPrefix string
 
 		isPurchase := weaponTracker.IsPurchase(e.Weapon, e.Player.SteamID64)
 		isPickup := false
@@ -437,10 +401,8 @@ func Start(filePath string) {
 
 		if isPurchase {
 			action = ActionPurchase
-			logPrefix = "购买"
 		} else if isPickup {
 			action = ActionPickup
-			logPrefix = "捡起"
 		} else {
 			return
 		}
@@ -452,13 +414,16 @@ func Start(filePath string) {
 			Action: action,
 		}
 		teamMap[playerName].Purchases = append(teamMap[playerName].Purchases, purchase)
-
-		ilog.InfoLogger.Printf("  [%s] %s (%s) 在 %.2f秒 %s了 %s (武器ID:%d)",
-			logPrefix, playerName, getTeamName(e.Player.Team), actionTime, logPrefix, weaponName, weaponID)
 	})
 
 	iParser.RegisterEventHandler(func(e events.WeaponFire) {
 		gs := iParser.GameState()
+
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			return
+		}
+
 		currentTick := gs.IngameTick()
 		key := TickPlayer{currentTick, e.Shooter.SteamID64}
 		if _, ok := buttonTickMap[key]; ok {
@@ -470,6 +435,12 @@ func Start(filePath string) {
 
 	iParser.RegisterEventHandler(func(e events.PlayerJump) {
 		gs := iParser.GameState()
+
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			return
+		}
+
 		currentTick := gs.IngameTick()
 		key := TickPlayer{currentTick, e.Player.SteamID64}
 		if _, ok := buttonTickMap[key]; ok {
@@ -485,6 +456,12 @@ func Start(filePath string) {
 		}
 
 		gs := iParser.GameState()
+
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			return
+		}
+
 		currentTick := gs.IngameTick()
 		key := TickPlayer{currentTick, e.Player.SteamID64}
 
@@ -504,6 +481,12 @@ func Start(filePath string) {
 		}
 
 		gs := iParser.GameState()
+
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			return
+		}
+
 		currentTick := gs.IngameTick()
 
 		ilog.InfoLogger.Printf("  [拆弹中止] %s (Tick: %d)",
@@ -516,6 +499,12 @@ func Start(filePath string) {
 		}
 
 		gs := iParser.GameState()
+
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			return
+		}
+
 		currentTick := gs.IngameTick()
 
 		ilog.InfoLogger.Printf("  [拆弹完成] %s 成功拆除炸弹 (Tick: %d)",
@@ -528,6 +517,12 @@ func Start(filePath string) {
 		}
 
 		gs := iParser.GameState()
+
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			return
+		}
+
 		currentTick := gs.IngameTick()
 		key := TickPlayer{currentTick, e.Player.SteamID64}
 
@@ -547,6 +542,12 @@ func Start(filePath string) {
 		}
 
 		gs := iParser.GameState()
+
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			return
+		}
+
 		currentTick := gs.IngameTick()
 
 		ilog.InfoLogger.Printf("  [埋弹中止] %s (Tick: %d)",
@@ -559,6 +560,12 @@ func Start(filePath string) {
 		}
 
 		gs := iParser.GameState()
+
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			return
+		}
+
 		currentTick := gs.IngameTick()
 
 		siteName := "未知"
@@ -574,6 +581,13 @@ func Start(filePath string) {
 	})
 
 	iParser.RegisterEventHandler(func(e events.GameHalfEnded) {
+		gs := iParser.GameState()
+
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			return
+		}
+
 		if currentRound != nil {
 			currentRound.isHalftime = true
 			ilog.InfoLogger.Printf("半场结束,回合 %d 包含换边时间", currentRound.roundNum)
@@ -582,11 +596,17 @@ func Start(filePath string) {
 
 	// 聊天消息处理
 	iParser.RegisterEventHandler(func(e events.ChatMessage) {
+		gs := iParser.GameState()
+
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			return
+		}
+
 		if currentRound == nil || !currentRound.started {
 			return
 		}
 
-		gs := iParser.GameState()
 		currentTick := gs.IngameTick()
 		chatTime := float64(currentTick-currentRound.freezetimeStart) / iParser.TickRate()
 
@@ -636,21 +656,43 @@ func Start(filePath string) {
 
 	iParser.RegisterEventHandler(func(e events.RoundStart) {
 		gs := iParser.GameState()
+		currentTick := gs.IngameTick()
+
+		// 检查热身状态
+		if gs.IsWarmupPeriod() {
+			ilog.InfoLogger.Printf("跳过热身回合 (Tick: %d)", currentTick)
+			if gameStarted {
+				ilog.InfoLogger.Printf("⚠ 检测到重新进入热身，重置游戏状态")
+				gameStarted = false
+				firstRoundDetected = false
+				roundNum = 0
+				currentRound = nil
+			}
+			return
+		}
+
+		// 如果当前回合还存在且已开始，不处理新的 RoundStart
+		if currentRound != nil && currentRound.started {
+			ilog.InfoLogger.Printf("⚠ 检测到重复的 RoundStart 事件 (Tick: %d)，当前回合 %d 还未结束，跳过", currentTick, currentRound.roundNum)
+			return
+		}
 
 		if !firstRoundDetected {
 			firstRoundDetected = true
+			gameStarted = true
 			roundNum = 1
-			ilog.InfoLogger.Printf("RoundStart事件检测到第一回合")
+			ilog.InfoLogger.Printf("检测到第一个正式回合开始")
 		} else {
 			roundNum++
 		}
-
-		currentTick := gs.IngameTick()
 
 		if currentRound != nil && currentRound.roundNum == roundNum {
 			ilog.InfoLogger.Printf("回合 %d 已初始化,跳过重复初始化", roundNum)
 			return
 		}
+
+		ilog.InfoLogger.Printf("====================================")
+		ilog.InfoLogger.Printf("回合 %d 开始 (Tick: %d)", roundNum, currentTick)
 
 		currentRound = &RoundInfo{
 			roundNum:        roundNum,
@@ -668,9 +710,6 @@ func Start(filePath string) {
 		allPurchaseData[fmt.Sprintf("round%d", roundNum)] = currentRoundPurchases
 
 		weaponTracker = NewWeaponTracker()
-
-		ilog.InfoLogger.Printf("====================================")
-		ilog.InfoLogger.Printf("回合 %d 开始 (Tick: %d)", roundNum, currentTick)
 
 		playerLastScopedState = make(map[uint64]bool)
 		playerLastWeapons = make(map[uint64][]string)
@@ -693,8 +732,14 @@ func Start(filePath string) {
 	})
 
 	iParser.RegisterEventHandler(func(e events.RoundFreezetimeEnd) {
+		gs := iParser.GameState()
+
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			return
+		}
+
 		if currentRound != nil {
-			gs := iParser.GameState()
 			currentTick := gs.IngameTick()
 
 			currentRound.freezetimeEnd = currentTick
@@ -710,8 +755,22 @@ func Start(filePath string) {
 	})
 
 	iParser.RegisterEventHandler(func(e events.RoundEnd) {
+		gs := iParser.GameState()
+
+		// 检查是否在热身
+		if gs.IsWarmupPeriod() {
+			ilog.InfoLogger.Printf("⚠ 回合结束时检测到热身状态，跳过保存")
+			currentRound = nil
+			return
+		}
+
+		if !gameStarted {
+			ilog.InfoLogger.Printf("⚠ 游戏未开始，跳过回合结束处理")
+			currentRound = nil
+			return
+		}
+
 		if currentRound != nil {
-			gs := iParser.GameState()
 			currentTick := gs.IngameTick()
 
 			currentRound.roundEnd = currentTick

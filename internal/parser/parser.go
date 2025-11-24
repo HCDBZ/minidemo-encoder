@@ -38,6 +38,15 @@ var currentRoundPurchases *RoundPurchaseData
 
 var outputBaseDir string
 
+// 帧率检测相关变量
+var (
+	detectedTickRate  float64 = 128.0
+	detectedFrameRate float64 = 128.0
+	timeScaleFactor   float64 = 1.0
+	frameRateDetected bool    = false
+	shouldInterpolate bool    = false
+)
+
 // C4持有者记录
 type C4HolderInfo struct {
 	RoundNum   int    `json:"round"`
@@ -147,6 +156,112 @@ func detectWeaponChanges(player *common.Player, currentTick int, buttonTickMap m
 	playerLastWeapons[steamID] = currentWeapons
 }
 
+// 检测demo的实际帧率
+func detectActualFrameRate(parser dem.Parser) {
+	var (
+		frameSamples  []float64
+		lastFrameTick int
+		sampleCount   int
+		maxSamples    = 500
+	)
+
+	parser.RegisterEventHandler(func(e events.FrameDone) {
+		gs := parser.GameState()
+
+		if gs.IsWarmupPeriod() || frameRateDetected {
+			return
+		}
+
+		currentTick := gs.IngameTick()
+
+		if lastFrameTick > 0 {
+			tickDiff := currentTick - lastFrameTick
+			if tickDiff > 0 && tickDiff < 10 {
+				frameSamples = append(frameSamples, float64(tickDiff))
+				sampleCount++
+			}
+		}
+
+		lastFrameTick = currentTick
+
+		if sampleCount >= maxSamples {
+			frameRateDetected = true
+
+			var sum float64
+			for _, sample := range frameSamples {
+				sum += sample
+			}
+			avgTicksPerFrame := sum / float64(len(frameSamples))
+
+			detectedTickRate = parser.TickRate()
+			detectedFrameRate = detectedTickRate / avgTicksPerFrame
+			timeScaleFactor = detectedFrameRate / detectedTickRate
+
+			ilog.InfoLogger.Printf("========== 帧率检测结果 ==========")
+			ilog.InfoLogger.Printf("Demo Tick Rate: %.2f", detectedTickRate)
+			ilog.InfoLogger.Printf("实际帧率: %.2f fps", detectedFrameRate)
+			ilog.InfoLogger.Printf("平均每帧间隔: %.2f ticks", avgTicksPerFrame)
+			ilog.InfoLogger.Printf("时间缩放因子: %.4f", timeScaleFactor)
+
+			// 智能判断是否需要插帧
+			const MIN_ACCEPTABLE_FPS = 90.0 // 最低可接受帧率
+			const MAX_NORMAL_FPS = 120.0    // 正常帧率上限
+
+			if detectedFrameRate < MIN_ACCEPTABLE_FPS {
+				shouldInterpolate = true
+				targetFPS := 128.0
+				interpolationRatio := targetFPS / detectedFrameRate
+				ilog.InfoLogger.Printf("  检测到低帧率 (%.1f fps)，将进行插帧优化", detectedFrameRate)
+				ilog.InfoLogger.Printf("  目标帧率: %.0f fps (插值比例: %.2fx)", targetFPS, interpolationRatio)
+			} else if detectedFrameRate > MAX_NORMAL_FPS {
+				shouldInterpolate = false
+				ilog.InfoLogger.Printf("  高帧率demo (%.1f fps)，无需处理", detectedFrameRate)
+			} else {
+				shouldInterpolate = false
+				ilog.InfoLogger.Printf("  帧率正常 (%.1f fps)，无需处理", detectedFrameRate)
+			}
+
+			ilog.InfoLogger.Printf("==================================")
+			saveDemoInfo()
+		}
+	})
+}
+
+func getAdjustedTime(tickDiff int, tickRate float64) float64 {
+	return float64(tickDiff) / tickRate
+}
+
+// 保存demo信息到文件
+func saveDemoInfo() {
+	infoFile := filepath.Join(outputBaseDir, "demo_info.json")
+
+	processingInfo := "无需处理"
+	if shouldInterpolate {
+		targetFPS := 128.0
+		interpolationRatio := targetFPS / detectedFrameRate
+		processingInfo = fmt.Sprintf("已进行插帧优化 (%.1f fps → %.0f fps, %.2fx)",
+			detectedFrameRate, targetFPS, interpolationRatio)
+	}
+
+	info := map[string]interface{}{
+		"tick_rate":           detectedTickRate,
+		"original_frame_rate": detectedFrameRate,
+		"target_frame_rate":   128.0,
+		"interpolated":        shouldInterpolate,
+		"interpolation_ratio": 128.0 / detectedFrameRate,
+		"note":                processingInfo,
+	}
+
+	data, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		ilog.ErrorLogger.Printf("保存demo信息失败: %s\n", err.Error())
+		return
+	}
+
+	os.WriteFile(infoFile, data, 0644)
+	ilog.InfoLogger.Printf("Demo信息已保存到: %s", infoFile)
+}
+
 func Start(filePath string) {
 	iFile, err := os.Open(filePath)
 	checkError(err)
@@ -180,6 +295,7 @@ func Start(filePath string) {
 	allChatMessages = make([]ChatMessage, 0)
 
 	var buttonTickMap map[TickPlayer]int32 = make(map[TickPlayer]int32)
+	detectActualFrameRate(iParser)
 	var playerLastScopedState map[uint64]bool = make(map[uint64]bool)
 	var playerLastWeapons map[uint64][]string = make(map[uint64][]string)
 	var (
@@ -290,7 +406,7 @@ func Start(filePath string) {
 
 		weaponTracker.RegisterDrop(e.Weapon, e.Player.SteamID64)
 
-		dropTime := float64(currentTick-currentRound.freezetimeStart) / iParser.TickRate()
+		dropTime := getAdjustedTime(currentTick-currentRound.freezetimeStart, iParser.TickRate())
 
 		var teamMap map[string]*PlayerPurchaseData
 		if e.Player.Team == common.TeamTerrorists {
@@ -367,7 +483,7 @@ func Start(filePath string) {
 			return
 		}
 
-		actionTime := float64(currentTick-currentRound.freezetimeStart) / iParser.TickRate()
+		actionTime := getAdjustedTime(currentTick-currentRound.freezetimeStart, iParser.TickRate())
 
 		var teamMap map[string]*PlayerPurchaseData
 		if e.Player.Team == common.TeamTerrorists {
@@ -608,7 +724,7 @@ func Start(filePath string) {
 		}
 
 		currentTick := gs.IngameTick()
-		chatTime := float64(currentTick-currentRound.freezetimeStart) / iParser.TickRate()
+		chatTime := getAdjustedTime(currentTick-currentRound.freezetimeStart, iParser.TickRate())
 
 		teamName := "Unknown"
 		var sender *common.Player
@@ -745,7 +861,7 @@ func Start(filePath string) {
 			currentRound.freezetimeEnd = currentTick
 			currentRound.inFreezeTime = false
 
-			freezeDuration := float64(currentTick-currentRound.freezetimeStart) / iParser.TickRate()
+			freezeDuration := getAdjustedTime(currentTick-currentRound.freezetimeStart, iParser.TickRate())
 			ilog.InfoLogger.Printf("回合 %d 冻结时间结束 (Tick: %d, 持续: %.2f秒)",
 				currentRound.roundNum, currentTick, freezeDuration)
 
@@ -757,30 +873,28 @@ func Start(filePath string) {
 	iParser.RegisterEventHandler(func(e events.RoundEnd) {
 		gs := iParser.GameState()
 
-		// 检查是否在热身
 		if gs.IsWarmupPeriod() {
-			ilog.InfoLogger.Printf("⚠ 回合结束时检测到热身状态，跳过保存")
+			ilog.InfoLogger.Printf("⚠  回合结束时检测到热身状态，跳过保存")
 			currentRound = nil
 			return
 		}
 
 		if !gameStarted {
-			ilog.InfoLogger.Printf("⚠ 游戏未开始，跳过回合结束处理")
+			ilog.InfoLogger.Printf("⚠  游戏未开始，跳过回合结束处理")
 			currentRound = nil
 			return
 		}
 
 		if currentRound != nil {
 			currentTick := gs.IngameTick()
-
 			currentRound.roundEnd = currentTick
 
-			freezeDuration := float64(currentRound.freezetimeEnd-currentRound.freezetimeStart) / iParser.TickRate()
+			freezeDuration := getAdjustedTime(currentRound.freezetimeEnd-currentRound.freezetimeStart, iParser.TickRate())
 
 			ilog.InfoLogger.Printf("回合 %d 结束 (Tick: %d)", currentRound.roundNum, currentTick)
 
 			if currentRound.isHalftime {
-				ilog.InfoLogger.Printf("  ⚠ 半场换边回合,冻结时间将使用最常见值")
+				ilog.InfoLogger.Printf("  ⚠  半场换边回合,冻结时间将使用最常见值")
 				freezeInfo := fmt.Sprintf("HALFTIME:%d", currentRound.roundNum)
 				allRoundsFreezeInfo = append(allRoundsFreezeInfo, freezeInfo)
 			} else {
@@ -799,11 +913,20 @@ func Start(filePath string) {
 
 			ilog.InfoLogger.Printf("  正在保存录像文件...")
 			savedCount := 0
+
 			for _, player := range Players {
 				if player != nil {
+					// 如果需要插帧，先进行插帧
+					if shouldInterpolate {
+						interpolatePlayerFrames(player.Name)
+					}
 					saveToRecFile(player, int32(currentRound.roundNum))
 					savedCount++
 				}
+			}
+
+			if shouldInterpolate {
+				ilog.InfoLogger.Printf("  ✓ 已对所有玩家进行插帧优化")
 			}
 
 			ilog.InfoLogger.Printf("  已保存 %d 个玩家录像到: %s/round%d/", savedCount, outputBaseDir, currentRound.roundNum)

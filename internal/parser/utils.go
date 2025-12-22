@@ -5,15 +5,23 @@ import (
 
 	encoder "github.com/hx-w/minidemo-encoder/internal/encoder"
 	ilog "github.com/hx-w/minidemo-encoder/internal/logger"
-	common "github.com/markus-wa/demoinfocs-golang/v2/pkg/demoinfocs/common"
+	common "github.com/markus-wa/demoinfocs-golang/v4/pkg/demoinfocs/common"
 )
 
 const Pi = 3.14159265358979323846
+const MaxMoveSpeed = 450.0
 
 var bufWeaponMap map[string]int32 = make(map[string]int32)
 var playerLastZ map[string]float32 = make(map[string]float32)
 
-// Function to handle errors
+type PlayerLastFrame struct {
+	Position  [3]float32
+	Velocity  [3]float32
+	ViewAngle float64
+}
+
+var playerLastFrame map[string]*PlayerLastFrame = make(map[string]*PlayerLastFrame)
+
 func checkError(err error) {
 	if err != nil {
 		ilog.ErrorLogger.Println(err.Error())
@@ -22,12 +30,25 @@ func checkError(err error) {
 }
 
 func parsePlayerInitFrame(player *common.Player) {
+	if player == nil {
+		return
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			ilog.WarningLogger.Printf("解析玩家初始帧失败 (%s): %v", player.Name, r)
+		}
+	}()
+
 	iFrameInit := encoder.FrameInitInfo{
 		PlayerName: player.Name,
 	}
-	iFrameInit.Position[0] = float32(player.Position().X)
-	iFrameInit.Position[1] = float32(player.Position().Y)
-	iFrameInit.Position[2] = float32(player.Position().Z)
+
+	pos := player.Position()
+	iFrameInit.Position[0] = float32(pos.X)
+	iFrameInit.Position[1] = float32(pos.Y)
+	iFrameInit.Position[2] = float32(pos.Z)
+
 	iFrameInit.Angles[0] = float32(player.ViewDirectionY())
 	iFrameInit.Angles[1] = float32(player.ViewDirectionX())
 
@@ -35,136 +56,222 @@ func parsePlayerInitFrame(player *common.Player) {
 	delete(bufWeaponMap, player.Name)
 	delete(encoder.PlayerFramesMap, player.Name)
 
-	playerLastZ[player.Name] = float32(player.Position().Z)
+	playerLastZ[player.Name] = float32(pos.Z)
 
-	// 记录玩家初始化信息
+	vel := player.Velocity()
+	playerLastFrame[player.Name] = &PlayerLastFrame{
+		Position:  [3]float32{float32(pos.X), float32(pos.Y), float32(pos.Z)},
+		Velocity:  [3]float32{float32(vel.X), float32(vel.Y), float32(vel.Z)},
+		ViewAngle: float64(player.ViewDirectionY()),
+	}
+
 	teamName := "T"
 	if player.Team == common.TeamCounterTerrorists {
 		teamName = "CT"
 	}
 	ilog.InfoLogger.Printf("  初始化玩家: %s (%s) at (%.1f, %.1f, %.1f)",
-		player.Name, teamName, player.Position().X, player.Position().Y, player.Position().Z)
+		player.Name, teamName, pos.X, pos.Y, pos.Z)
 }
 
 func normalizeDegree(degree float64) float64 {
-	if degree < 0.0 {
-		degree = degree + 360.0
+	for degree >= 360.0 {
+		degree -= 360.0
+	}
+	for degree < 0.0 {
+		degree += 360.0
 	}
 	return degree
 }
 
-// accept radian, return degree in [0, 360)
 func radian2degree(radian float64) float64 {
 	return normalizeDegree(radian * 180 / Pi)
 }
 
+func worldVelocityToMoveInput(worldVelX, worldVelY, viewAngleY float64) (moveForward, moveRight float32) {
+	velMag := math.Sqrt(worldVelX*worldVelX + worldVelY*worldVelY)
+
+	if velMag < 1.0 {
+		return 0, 0
+	}
+
+	angleRad := viewAngleY * Pi / 180.0
+	sinAngle := math.Sin(angleRad)
+	cosAngle := math.Cos(angleRad)
+
+	relForward := worldVelX*cosAngle + worldVelY*sinAngle
+	relRight := -worldVelX*sinAngle + worldVelY*cosAngle
+
+	const MAX_GROUND_SPEED = 250.0
+
+	inputMagnitude := math.Min(velMag/MAX_GROUND_SPEED, 1.0) * MaxMoveSpeed
+
+	dirMag := math.Sqrt(relForward*relForward + relRight*relRight)
+	if dirMag > 0.01 {
+		relForward /= dirMag
+		relRight /= dirMag
+	}
+
+	moveForward = float32(relForward * inputMagnitude)
+	moveRight = float32(-relRight * inputMagnitude)
+
+	return moveForward, moveRight
+}
+
+func shouldSetKeyframe(playerName string, currentIdx int, tickrate float64, fullsnap bool,
+	currentPos, lastPos [3]float32, currentVel, lastVel [3]float32) bool {
+
+	if fullsnap {
+		return true
+	}
+
+	if currentIdx > 0 && currentIdx%128 == 0 {
+		return true
+	}
+
+	if currentIdx > 0 {
+		dt := 1.0 / tickrate
+		predictX := lastPos[0] + lastVel[0]*float32(dt)
+		predictY := lastPos[1] + lastVel[1]*float32(dt)
+
+		errorX := currentPos[0] - predictX
+		errorY := currentPos[1] - predictY
+		posError := math.Sqrt(float64(errorX*errorX + errorY*errorY))
+
+		if posError > 2.0 {
+			return true
+		}
+	}
+
+	velChangeX := currentVel[0] - lastVel[0]
+	velChangeY := currentVel[1] - lastVel[1]
+	velChange := math.Sqrt(float64(velChangeX*velChangeX + velChangeY*velChangeY))
+
+	if velChange > 100.0 {
+		return true
+	}
+
+	return false
+}
+
 func parsePlayerFrame(player *common.Player, addonButton int32, tickrate float64, fullsnap bool) {
+	if player == nil {
+		return
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			return
+		}
+	}()
+
 	if !player.IsAlive() {
 		return
 	}
-	iFrameInfo := new(encoder.FrameInfo)
-	iFrameInfo.PredictedVelocity[0] = 0.0
-	iFrameInfo.PredictedVelocity[1] = 0.0
-	iFrameInfo.PredictedVelocity[2] = 0.0
-	iFrameInfo.ActualVelocity[0] = float32(player.Velocity().X)
-	iFrameInfo.ActualVelocity[1] = float32(player.Velocity().Y)
-	iFrameInfo.ActualVelocity[2] = float32(player.Velocity().Z)
-	iFrameInfo.PredictedAngles[0] = player.ViewDirectionY()
-	iFrameInfo.PredictedAngles[1] = player.ViewDirectionX()
 
-	// 每帧都记录位置
-	iFrameInfo.Origin[0] = float32(player.Position().X)
-	iFrameInfo.Origin[1] = float32(player.Position().Y)
-	iFrameInfo.Origin[2] = float32(player.Position().Z)
+	iFrameInfo := new(encoder.FrameInfo)
+	playerName := player.Name
+
+	vel := player.Velocity()
+	pos := player.Position()
+	viewAngleY := player.ViewDirectionY()
+	viewAngleX := player.ViewDirectionX()
+
+	// ActualVelocity: 实际速度
+	iFrameInfo.ActualVelocity[0] = float32(vel.X)
+	iFrameInfo.ActualVelocity[1] = float32(vel.Y)
+
+	lastZ, hasLastZ := playerLastZ[playerName]
+	if hasLastZ {
+		deltaZ := float32(pos.Z) - lastZ
+		iFrameInfo.ActualVelocity[2] = deltaZ * float32(tickrate)
+	} else {
+		iFrameInfo.ActualVelocity[2] = float32(vel.Z)
+	}
+	playerLastZ[playerName] = float32(pos.Z)
+
+	// PredictedVelocity: 输入向量
+	moveForward, moveRight := worldVelocityToMoveInput(
+		float64(vel.X),
+		float64(vel.Y),
+		float64(viewAngleY),
+	)
+
+	iFrameInfo.PredictedVelocity[0] = moveForward
+	iFrameInfo.PredictedVelocity[1] = moveRight
+	iFrameInfo.PredictedVelocity[2] = iFrameInfo.ActualVelocity[2]
+
+	// 视角
+	iFrameInfo.PredictedAngles[0] = viewAngleY
+	iFrameInfo.PredictedAngles[1] = viewAngleX
+
+	// 位置
+	iFrameInfo.Origin[0] = float32(pos.X)
+	iFrameInfo.Origin[1] = float32(pos.Y)
+	iFrameInfo.Origin[2] = float32(pos.Z)
 
 	iFrameInfo.PlayerImpulse = 0
 	iFrameInfo.PlayerSeed = 0
 	iFrameInfo.PlayerSubtype = 0
-	// ----- button encode
 	iFrameInfo.PlayerButtons = ButtonConvert(player, addonButton)
 
-	// ---- weapon encode
+	// 武器编码
 	var currWeaponID int32 = 0
-	if player.ActiveWeapon() != nil {
-		currWeaponID = int32(WeaponStr2ID(player.ActiveWeapon().String()))
+	activeWeapon := player.ActiveWeapon()
+	if activeWeapon != nil {
+		currWeaponID = int32(WeaponStr2ID(activeWeapon.String()))
 	}
-	if len(encoder.PlayerFramesMap[player.Name]) == 0 {
+
+	if len(encoder.PlayerFramesMap[playerName]) == 0 {
 		iFrameInfo.CSWeaponID = currWeaponID
-		bufWeaponMap[player.Name] = currWeaponID
-	} else if currWeaponID == bufWeaponMap[player.Name] {
+		bufWeaponMap[playerName] = currWeaponID
+	} else if currWeaponID == bufWeaponMap[playerName] {
 		iFrameInfo.CSWeaponID = int32(CSWeapon_NONE)
 	} else {
 		iFrameInfo.CSWeaponID = currWeaponID
-		bufWeaponMap[player.Name] = currWeaponID
+		bufWeaponMap[playerName] = currWeaponID
 	}
 
-	lastIdx := len(encoder.PlayerFramesMap[player.Name]) - 1
-	// addons - 在冻结时间或每2秒添加关键帧
-	if fullsnap || (lastIdx+1)%int(tickrate*2) == 0 {
+	// 关键帧
+	currentIdx := len(encoder.PlayerFramesMap[playerName])
+
+	var lastPos [3]float32
+	var lastVel [3]float32
+
+	lastFrame, hasLastFrame := playerLastFrame[playerName]
+	if hasLastFrame {
+		lastPos = lastFrame.Position
+		lastVel = lastFrame.Velocity
+	}
+
+	currentPos := [3]float32{float32(pos.X), float32(pos.Y), float32(pos.Z)}
+	currentVel := [3]float32{float32(vel.X), float32(vel.Y), float32(vel.Z)}
+
+	if shouldSetKeyframe(playerName, currentIdx, tickrate, fullsnap, currentPos, lastPos, currentVel, lastVel) {
 		iFrameInfo.AdditionalFields |= encoder.FIELDS_ORIGIN
-		iFrameInfo.AtOrigin[0] = float32(player.Position().X)
-		iFrameInfo.AtOrigin[1] = float32(player.Position().Y)
-		iFrameInfo.AtOrigin[2] = float32(player.Position().Z)
+		iFrameInfo.AtOrigin[0] = float32(pos.X)
+		iFrameInfo.AtOrigin[1] = float32(pos.Y)
+		iFrameInfo.AtOrigin[2] = float32(pos.Z)
 
 		iFrameInfo.AdditionalFields |= encoder.FIELDS_VELOCITY
-		iFrameInfo.AtVelocity[0] = float32(player.Velocity().X)
-		iFrameInfo.AtVelocity[1] = float32(player.Velocity().Y)
-		iFrameInfo.AtVelocity[2] = float32(player.Velocity().Z)
-	}
-	// record Z velocity
-	deltaZ := float32(player.Position().Z) - playerLastZ[player.Name]
-	playerLastZ[player.Name] = float32(player.Position().Z)
-
-	// velocity in Z direction need to be recorded specially
-	iFrameInfo.ActualVelocity[2] = deltaZ * float32(tickrate)
-
-	// Since I don't know how to get player's button bits in a tick frame,
-	// I have to use *actual vels* and *angles* to generate *predicted vels* approximately
-	// This will cause some error, but it's not a big deal
-	if lastIdx >= 0 { // not first frame
-		// We assume that actual velocity in tick N
-		// is influenced by predicted velocity in tick N-1
-		_preVel := &encoder.PlayerFramesMap[player.Name][lastIdx].PredictedVelocity
-
-		// PV = 0.0 when AV(tick N-1) = 0.0 and AV(tick N) = 0.0 ?
-		// Note: AV=Actual Velocity, PV=Predicted Velocity
-		if !(iFrameInfo.ActualVelocity[0] == 0.0 &&
-			iFrameInfo.ActualVelocity[1] == 0.0 &&
-			encoder.PlayerFramesMap[player.Name][lastIdx].ActualVelocity[0] == 0.0 &&
-			encoder.PlayerFramesMap[player.Name][lastIdx].ActualVelocity[1] == 0.0) {
-			var velAngle float64 = 0.0
-			if iFrameInfo.ActualVelocity[0] == 0.0 {
-				if iFrameInfo.ActualVelocity[1] < 0.0 {
-					velAngle = 270.0
-				} else {
-					velAngle = 90.0
-				}
-			} else {
-				velAngle = radian2degree(math.Atan2(float64(iFrameInfo.ActualVelocity[1]), float64(iFrameInfo.ActualVelocity[0])))
-			}
-			faceFront := normalizeDegree(float64(iFrameInfo.PredictedAngles[1]))
-			deltaAngle := normalizeDegree(velAngle - faceFront)
-
-			const threshold = 30.0
-			if 0.0+threshold < deltaAngle && deltaAngle < 180.0-threshold {
-				_preVel[1] = -450.0 // left
-			}
-			if 90.0+threshold < deltaAngle && deltaAngle < 270.0-threshold {
-				_preVel[0] = -450.0 // back
-			}
-			if 180.0+threshold < deltaAngle && deltaAngle < 360.0-threshold {
-				_preVel[1] = 450.0 // right
-			}
-			if 270.0+threshold < deltaAngle || deltaAngle < 90.0-threshold {
-				_preVel[0] = 450.0 // front
-			}
-		}
+		iFrameInfo.AtVelocity[0] = float32(vel.X)
+		iFrameInfo.AtVelocity[1] = float32(vel.Y)
+		iFrameInfo.AtVelocity[2] = iFrameInfo.ActualVelocity[2]
 	}
 
-	encoder.PlayerFramesMap[player.Name] = append(encoder.PlayerFramesMap[player.Name], *iFrameInfo)
+	playerLastFrame[playerName] = &PlayerLastFrame{
+		Position:  currentPos,
+		Velocity:  currentVel,
+		ViewAngle: float64(viewAngleY),
+	}
+
+	encoder.PlayerFramesMap[playerName] = append(encoder.PlayerFramesMap[playerName], *iFrameInfo)
 }
 
 func saveToRecFile(player *common.Player, roundNum int32) {
+	if player == nil {
+		return
+	}
+
 	teamSuffix := "t"
 	if player.Team == common.TeamCounterTerrorists {
 		teamSuffix = "ct"
@@ -173,13 +280,10 @@ func saveToRecFile(player *common.Player, roundNum int32) {
 	encoder.WriteToRecFile(player.Name, roundNum, teamSuffix)
 }
 
-// 插值相关函数
-// 线性插值函数
 func lerp(a, b, t float32) float32 {
 	return a + (b-a)*t
 }
 
-// Catmull-Rom 样条插值
 func catmullRom(p0, p1, p2, p3, t float32) float32 {
 	t2 := t * t
 	t3 := t2 * t
@@ -190,12 +294,9 @@ func catmullRom(p0, p1, p2, p3, t float32) float32 {
 		(-p0+3.0*p1-3.0*p2+p3)*t3)
 }
 
-// 角度插值（处理360度环绕问题）
 func lerpAngle(a, b, t float32) float32 {
-	// 计算最短角度差
 	diff := b - a
 
-	// 处理角度环绕（-180 到 180）
 	if diff > 180 {
 		diff -= 360
 	} else if diff < -180 {
@@ -204,7 +305,6 @@ func lerpAngle(a, b, t float32) float32 {
 
 	result := a + diff*t
 
-	// 标准化到 [-180, 180] 范围
 	for result > 180 {
 		result -= 360
 	}
@@ -213,120 +313,4 @@ func lerpAngle(a, b, t float32) float32 {
 	}
 
 	return result
-}
-
-func interpolatePlayerFrames(playerName string) {
-	frames := encoder.PlayerFramesMap[playerName]
-	if len(frames) <= 1 {
-		return
-	}
-
-	originalCount := len(frames)
-	targetFPS := 128.0
-	currentFPS := detectedFrameRate
-
-	// 计算需要插入多少帧
-	interpolationFactor := int(targetFPS / currentFPS)
-	if interpolationFactor <= 1 {
-		return // 不需要插帧
-	}
-
-	var interpolatedFrames []encoder.FrameInfo
-
-	// 对每两帧之间进行插值
-	for i := 0; i < len(frames)-1; i++ {
-		currentFrame := frames[i]
-		nextFrame := frames[i+1]
-
-		// 添加当前帧
-		interpolatedFrames = append(interpolatedFrames, currentFrame)
-
-		// 获取前后帧用于更平滑的插值
-		var prevFrame, nextNextFrame encoder.FrameInfo
-		if i > 0 {
-			prevFrame = frames[i-1]
-		} else {
-			prevFrame = currentFrame
-		}
-		if i < len(frames)-2 {
-			nextNextFrame = frames[i+2]
-		} else {
-			nextNextFrame = nextFrame
-		}
-
-		// 在当前帧和下一帧之间插入 (interpolationFactor - 1) 个帧
-		for j := 1; j < interpolationFactor; j++ {
-			t := float32(j) / float32(interpolationFactor)
-
-			midFrame := encoder.FrameInfo{}
-
-			// 使用 Catmull-Rom 样条插值位置（更平滑）
-			for k := 0; k < 3; k++ {
-				midFrame.Origin[k] = catmullRom(
-					prevFrame.Origin[k],
-					currentFrame.Origin[k],
-					nextFrame.Origin[k],
-					nextNextFrame.Origin[k],
-					t,
-				)
-			}
-
-			// 速度使用线性插值（速度变化本来就快）
-			for k := 0; k < 3; k++ {
-				midFrame.ActualVelocity[k] = lerp(currentFrame.ActualVelocity[k], nextFrame.ActualVelocity[k], t)
-				midFrame.PredictedVelocity[k] = lerp(currentFrame.PredictedVelocity[k], nextFrame.PredictedVelocity[k], t)
-			}
-
-			// 角度使用专门的角度插值（处理360度环绕）
-			midFrame.PredictedAngles[0] = lerpAngle(currentFrame.PredictedAngles[0], nextFrame.PredictedAngles[0], t)
-			midFrame.PredictedAngles[1] = lerpAngle(currentFrame.PredictedAngles[1], nextFrame.PredictedAngles[1], t)
-
-			// 按钮状态：使用当前帧的按钮（不插值）
-			midFrame.PlayerButtons = currentFrame.PlayerButtons
-			midFrame.PlayerImpulse = currentFrame.PlayerImpulse
-			midFrame.PlayerSeed = currentFrame.PlayerSeed
-			midFrame.PlayerSubtype = currentFrame.PlayerSubtype
-
-			// 武器切换：只在原始帧保留，插值帧设为NONE
-			midFrame.CSWeaponID = int32(CSWeapon_NONE)
-
-			// 处理附加字段
-			midFrame.AdditionalFields = 0
-
-			// 如果两帧都有Origin附加字段，进行插值
-			if currentFrame.AdditionalFields&encoder.FIELDS_ORIGIN != 0 &&
-				nextFrame.AdditionalFields&encoder.FIELDS_ORIGIN != 0 {
-				midFrame.AdditionalFields |= encoder.FIELDS_ORIGIN
-				for k := 0; k < 3; k++ {
-					midFrame.AtOrigin[k] = catmullRom(
-						prevFrame.AtOrigin[k],
-						currentFrame.AtOrigin[k],
-						nextFrame.AtOrigin[k],
-						nextNextFrame.AtOrigin[k],
-						t,
-					)
-				}
-			}
-
-			// 如果两帧都有Velocity附加字段，进行插值
-			if currentFrame.AdditionalFields&encoder.FIELDS_VELOCITY != 0 &&
-				nextFrame.AdditionalFields&encoder.FIELDS_VELOCITY != 0 {
-				midFrame.AdditionalFields |= encoder.FIELDS_VELOCITY
-				for k := 0; k < 3; k++ {
-					midFrame.AtVelocity[k] = lerp(currentFrame.AtVelocity[k], nextFrame.AtVelocity[k], t)
-				}
-			}
-
-			interpolatedFrames = append(interpolatedFrames, midFrame)
-		}
-	}
-
-	// 添加最后一帧
-	interpolatedFrames = append(interpolatedFrames, frames[len(frames)-1])
-
-	newCount := len(interpolatedFrames)
-	encoder.PlayerFramesMap[playerName] = interpolatedFrames
-
-	ilog.InfoLogger.Printf("    [插帧] %s: %d帧 → %d帧 (%.1fx)",
-		playerName, originalCount, newCount, float64(newCount)/float64(originalCount))
 }

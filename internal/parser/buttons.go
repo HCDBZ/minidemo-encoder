@@ -1,8 +1,7 @@
 package parser
 
 import (
-	// ilog "github.com/hx-w/minidemo-encoder/internal/logger"
-	common "github.com/markus-wa/demoinfocs-golang/v2/pkg/demoinfocs/common"
+	common "github.com/markus-wa/demoinfocs-golang/v4/pkg/demoinfocs/common"
 )
 
 const (
@@ -32,6 +31,7 @@ const (
 	IN_GRENADE1        = (1 << 23) /**< grenade 1 */
 	IN_GRENADE2        = (1 << 24) /**< grenade 2 */
 	IN_ATTACK3         = (1 << 25)
+	IN_DROP            = (1 << 26) /**< 武器丢弃按钮 */
 )
 
 func ButtonConvert(player *common.Player, addonButton int32) int32 {
@@ -46,4 +46,12 @@ func ButtonConvert(player *common.Player, addonButton int32) int32 {
 		button |= IN_RELOAD
 	}
 	return button
+}
+
+func EncodeDropButtonWithSlot(slot int) int32 {
+	if slot < 0 || slot > 5 {
+		slot = 0
+	}
+	slotEncoded := int32(slot + 1)
+	return IN_DROP | (slotEncoded << 27)
 }

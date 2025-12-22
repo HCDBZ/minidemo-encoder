@@ -74,11 +74,9 @@ func InitPlayer(initFrame FrameInitInfo) {
 }
 
 func WriteToRecFile(playerName string, roundNum int32, teamSide string) {
-	// 新的目录结构：output/demo名称/round1/t/ 或 output/demo名称/round1/ct/
 	roundDir := fmt.Sprintf("%s/round%d", saveDir, roundNum)
 	teamDir := fmt.Sprintf("%s/%s", roundDir, teamSide)
 
-	// 确保目录存在
 	if ok, _ := PathExists(teamDir); !ok {
 		err := os.MkdirAll(teamDir, os.ModePerm)
 		if err != nil {

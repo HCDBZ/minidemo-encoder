@@ -5,14 +5,31 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/hx-w/minidemo-encoder/internal/encoder"
 	ilog "github.com/hx-w/minidemo-encoder/internal/logger"
-	dem "github.com/markus-wa/demoinfocs-golang/v2/pkg/demoinfocs"
-	common "github.com/markus-wa/demoinfocs-golang/v2/pkg/demoinfocs/common"
-	events "github.com/markus-wa/demoinfocs-golang/v2/pkg/demoinfocs/events"
+	dem "github.com/markus-wa/demoinfocs-golang/v4/pkg/demoinfocs"
+	common "github.com/markus-wa/demoinfocs-golang/v4/pkg/demoinfocs/common"
+	events "github.com/markus-wa/demoinfocs-golang/v4/pkg/demoinfocs/events"
 )
+
+func getTeamPlayers(gs dem.GameState) (tPlayers, ctPlayers []*common.Player) {
+	if tTeam := gs.TeamTerrorists(); tTeam != nil {
+		tPlayers = tTeam.Members()
+	}
+	if ctTeam := gs.TeamCounterTerrorists(); ctTeam != nil {
+		ctPlayers = ctTeam.Members()
+	}
+	return tPlayers, ctPlayers
+}
+
+func getAllPlayers(gs dem.GameState) []*common.Player {
+	tPlayers, ctPlayers := getTeamPlayers(gs)
+	return append(tPlayers, ctPlayers...)
+}
 
 type TickPlayer struct {
 	tick    int
@@ -20,44 +37,22 @@ type TickPlayer struct {
 }
 
 type RoundInfo struct {
-	roundNum           int
-	freezetimeStart    int
-	freezetimeEnd      int
-	roundEnd           int
-	inFreezeTime       bool
-	isHalftime         bool
-	started            bool
-	buyTimeEnd         int
-	inventoryCheckTime int
+	roundNum        int
+	freezetimeStart int
+	freezetimeEnd   int
+	roundEnd        int
+	inFreezeTime    bool
+	isHalftime      bool
+	started         bool
+	buyTimeEnd      int
+	dropAllowedTick int
 }
 
-var allRoundsFreezeInfo []string
-var allFreezeDurations []float64
-
-var allPurchaseData AllRoundsPurchaseData
-var weaponTracker *WeaponTracker
-var currentRoundPurchases *RoundPurchaseData
-
-var outputBaseDir string
-
-// 帧率检测相关变量
-var (
-	detectedTickRate  float64 = 128.0
-	detectedFrameRate float64 = 128.0
-	timeScaleFactor   float64 = 1.0
-	frameRateDetected bool    = false
-	shouldInterpolate bool    = false
-)
-
-// C4持有者记录
 type C4HolderInfo struct {
 	RoundNum   int    `json:"round"`
 	PlayerName string `json:"player_name"`
 }
 
-var allC4Holders []C4HolderInfo
-
-// 聊天消息记录
 type ChatMessage struct {
 	Round      int     `json:"round"`
 	Time       float64 `json:"time"`
@@ -67,29 +62,60 @@ type ChatMessage struct {
 	IsTeamChat bool    `json:"is_team_chat"`
 }
 
-var allChatMessages []ChatMessage
-
-// 玩家信息记录
 type PlayerInfo struct {
 	SteamID       uint64 `json:"steamid"`
 	CrosshairCode string `json:"crosshair_code"`
 }
 
-var allPlayersInfo map[string]*PlayerInfo
+type SpawnPosition struct {
+	PlayerName string `json:"player_name"`
+	Team       string `json:"team"`
+	Position   string `json:"position"`
+}
 
-// 初始化玩家到正确的队伍，避免重复
+type RoundSpawnData struct {
+	Round  int             `json:"round"`
+	Spawns []SpawnPosition `json:"spawns"`
+}
+
+var (
+	allRoundsFreezeInfo   []string
+	allFreezeDurations    []float64
+	allPurchaseData       AllRoundsPurchaseData
+	weaponTracker         *WeaponTracker
+	currentRoundPurchases *RoundPurchaseData
+	outputBaseDir         string
+
+	detectedTickRate  float64 = 128.0
+	detectedFrameRate float64 = 128.0
+	timeScaleFactor   float64 = 1.0
+	frameRateDetected bool    = false
+	needInterpolation bool    = false
+	targetFrameRate   float64 = 128.0
+
+	allC4Holders    []C4HolderInfo
+	allChatMessages []ChatMessage
+	allRoundsSpawns []RoundSpawnData
+	allPlayersInfo  map[string]*PlayerInfo
+
+	buttonTickMap map[TickPlayer]int32
+
+	playerLastScopedState map[uint64]bool
+
+	recentPickups map[TickPlayer]int
+
+	purchasedThisTick map[TickPlayer]int64
+)
+
 func initializePlayerInRound(player *common.Player, roundPurchases *RoundPurchaseData) {
 	if player == nil || roundPurchases == nil {
 		return
 	}
 
 	playerName := player.Name
-
-	// 先从两个队伍中都移除该玩家（避免重复）
 	delete(roundPurchases.T, playerName)
 	delete(roundPurchases.CT, playerName)
 
-	// 然后根据当前队伍添加到正确的位置
 	var teamMap map[string]*PlayerPurchaseData
 	if player.Team == common.TeamTerrorists {
 		teamMap = roundPurchases.T
@@ -99,66 +125,64 @@ func initializePlayerInRound(player *common.Player, roundPurchases *RoundPurchas
 
 	if teamMap != nil {
 		teamMap[playerName] = &PlayerPurchaseData{
-			Purchases:      []PurchaseRecord{},
-			FinalInventory: []string{},
+			InitialInventory:      getFinalInventory(player),
+			Purchases:             []PurchaseRecord{},
+			FreezetimeEndGrenades: []string{},
 		}
 	}
 }
 
-// 武器变化检测函数
-func detectWeaponChanges(player *common.Player, currentTick int, buttonTickMap map[TickPlayer]int32, playerLastWeapons map[uint64][]string) {
-	if player == nil {
+// 插帧
+func interpolateFrames(playerName string, sourceRate, targetRate, tickrate float64) {
+	frames := encoder.PlayerFramesMap[playerName]
+	if len(frames) < 2 {
 		return
 	}
 
-	steamID := player.SteamID64
-
-	currentWeapons := []string{}
-	for _, weapon := range player.Weapons() {
-		if weapon != nil {
-			weaponName := getEquipmentName(weapon)
-			if weaponName != "" && !shouldFilterWeapon(weaponName) {
-				currentWeapons = append(currentWeapons, weaponName)
-			}
-		}
+	ratio := targetRate / sourceRate
+	if ratio <= 1.0 {
+		return
 	}
 
-	lastWeapons, exists := playerLastWeapons[steamID]
+	lastFrame := frames[len(frames)-1]
+	prevFrame := frames[len(frames)-2]
+	numInterp := int(ratio) - 1
 
-	if exists {
-		for _, lastWeapon := range lastWeapons {
-			found := false
-			for _, currentWeapon := range currentWeapons {
-				if currentWeapon == lastWeapon {
-					found = true
-					break
-				}
-			}
+	for i := 1; i <= numInterp; i++ {
+		t := float32(i) / float32(numInterp+1)
 
-			if !found {
-				// 武器消失
-			}
+		interpFrame := encoder.FrameInfo{
+			ActualVelocity: [3]float32{
+				lerp(prevFrame.ActualVelocity[0], lastFrame.ActualVelocity[0], t),
+				lerp(prevFrame.ActualVelocity[1], lastFrame.ActualVelocity[1], t),
+				lerp(prevFrame.ActualVelocity[2], lastFrame.ActualVelocity[2], t),
+			},
+			PredictedVelocity: [3]float32{
+				lerp(prevFrame.PredictedVelocity[0], lastFrame.PredictedVelocity[0], t),
+				lerp(prevFrame.PredictedVelocity[1], lastFrame.PredictedVelocity[1], t),
+				lerp(prevFrame.PredictedVelocity[2], lastFrame.PredictedVelocity[2], t),
+			},
+			PredictedAngles: [2]float32{
+				lerpAngle(prevFrame.PredictedAngles[0], lastFrame.PredictedAngles[0], t),
+				lerpAngle(prevFrame.PredictedAngles[1], lastFrame.PredictedAngles[1], t),
+			},
+			Origin: [3]float32{
+				lerp(prevFrame.Origin[0], lastFrame.Origin[0], t),
+				lerp(prevFrame.Origin[1], lastFrame.Origin[1], t),
+				lerp(prevFrame.Origin[2], lastFrame.Origin[2], t),
+			},
+			PlayerButtons:    prevFrame.PlayerButtons,
+			CSWeaponID:       int32(CSWeapon_NONE),
+			AdditionalFields: 0,
 		}
 
-		for _, currentWeapon := range currentWeapons {
-			found := false
-			for _, lastWeapon := range lastWeapons {
-				if currentWeapon == lastWeapon {
-					found = true
-					break
-				}
-			}
-
-			if !found {
-				// 新武器出现
-			}
-		}
+		frames = append(frames[:len(frames)-1], interpFrame, lastFrame)
 	}
 
-	playerLastWeapons[steamID] = currentWeapons
+	encoder.PlayerFramesMap[playerName] = frames
 }
 
-// 检测demo的实际帧率
+// 帧率检测
 func detectActualFrameRate(parser dem.Parser) {
 	var (
 		frameSamples  []float64
@@ -199,31 +223,17 @@ func detectActualFrameRate(parser dem.Parser) {
 			detectedFrameRate = detectedTickRate / avgTicksPerFrame
 			timeScaleFactor = detectedFrameRate / detectedTickRate
 
+			needInterpolation = detectedFrameRate < targetFrameRate
+			if needInterpolation {
+				ilog.InfoLogger.Printf("将从 %.2f fps 插帧到 %.2f fps", detectedFrameRate, targetFrameRate)
+			}
+
 			ilog.InfoLogger.Printf("========== 帧率检测结果 ==========")
 			ilog.InfoLogger.Printf("Demo Tick Rate: %.2f", detectedTickRate)
 			ilog.InfoLogger.Printf("实际帧率: %.2f fps", detectedFrameRate)
 			ilog.InfoLogger.Printf("平均每帧间隔: %.2f ticks", avgTicksPerFrame)
-			ilog.InfoLogger.Printf("时间缩放因子: %.4f", timeScaleFactor)
-
-			// 智能判断是否需要插帧
-			const MIN_ACCEPTABLE_FPS = 90.0 // 最低可接受帧率
-			const MAX_NORMAL_FPS = 120.0    // 正常帧率上限
-
-			if detectedFrameRate < MIN_ACCEPTABLE_FPS {
-				shouldInterpolate = true
-				targetFPS := 128.0
-				interpolationRatio := targetFPS / detectedFrameRate
-				ilog.InfoLogger.Printf("  检测到低帧率 (%.1f fps)，将进行插帧优化", detectedFrameRate)
-				ilog.InfoLogger.Printf("  目标帧率: %.0f fps (插值比例: %.2fx)", targetFPS, interpolationRatio)
-			} else if detectedFrameRate > MAX_NORMAL_FPS {
-				shouldInterpolate = false
-				ilog.InfoLogger.Printf("  高帧率demo (%.1f fps)，无需处理", detectedFrameRate)
-			} else {
-				shouldInterpolate = false
-				ilog.InfoLogger.Printf("  帧率正常 (%.1f fps)，无需处理", detectedFrameRate)
-			}
-
 			ilog.InfoLogger.Printf("==================================")
+
 			saveDemoInfo()
 		}
 	})
@@ -233,25 +243,13 @@ func getAdjustedTime(tickDiff int, tickRate float64) float64 {
 	return float64(tickDiff) / tickRate
 }
 
-// 保存demo信息到文件
 func saveDemoInfo() {
 	infoFile := filepath.Join(outputBaseDir, "demo_info.json")
 
-	processingInfo := "无需处理"
-	if shouldInterpolate {
-		targetFPS := 128.0
-		interpolationRatio := targetFPS / detectedFrameRate
-		processingInfo = fmt.Sprintf("已进行插帧优化 (%.1f fps → %.0f fps, %.2fx)",
-			detectedFrameRate, targetFPS, interpolationRatio)
-	}
-
 	info := map[string]interface{}{
-		"tick_rate":           detectedTickRate,
-		"original_frame_rate": detectedFrameRate,
-		"target_frame_rate":   128.0,
-		"interpolated":        shouldInterpolate,
-		"interpolation_ratio": 128.0 / detectedFrameRate,
-		"note":                processingInfo,
+		"tick_rate":  detectedTickRate,
+		"frame_rate": detectedFrameRate,
+		"time_scale": timeScaleFactor,
 	}
 
 	data, err := json.MarshalIndent(info, "", "  ")
@@ -264,9 +262,32 @@ func saveDemoInfo() {
 	ilog.InfoLogger.Printf("Demo信息已保存到: %s", infoFile)
 }
 
+// 判断是否为狙击步枪
+func isSniperRifle(weapon *common.Equipment) bool {
+	if weapon == nil {
+		return false
+	}
+	switch weapon.Type {
+	case common.EqAWP, common.EqScout, common.EqG3SG1, common.EqScar20, common.EqSG556, common.EqAUG:
+		return true
+	}
+	return false
+}
+
+// 主解析函数
 func Start(filePath string) {
+	defer func() {
+		if r := recover(); r != nil {
+			ilog.ErrorLogger.Printf("解析过程发生严重错误: %v", r)
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			ilog.ErrorLogger.Printf("堆栈信息:\n%s", buf[:n])
+		}
+	}()
+
 	iFile, err := os.Open(filePath)
 	checkError(err)
+	defer iFile.Close()
 
 	iParser := dem.NewParser(iFile)
 	defer iParser.Close()
@@ -275,7 +296,6 @@ func Start(filePath string) {
 	demoName := strings.TrimSuffix(demoFileName, filepath.Ext(demoFileName))
 
 	outputBaseDir = filepath.Join("output", demoName)
-
 	err = os.MkdirAll(outputBaseDir, os.ModePerm)
 	if err != nil {
 		ilog.ErrorLogger.Printf("创建输出目录失败: %s\n", err.Error())
@@ -283,65 +303,77 @@ func Start(filePath string) {
 	}
 
 	encoder.SetSaveDir(outputBaseDir)
-
 	ilog.InfoLogger.Printf("输出目录: %s", outputBaseDir)
 
+	// 初始化全局变量
 	allRoundsFreezeInfo = make([]string, 0)
 	allFreezeDurations = make([]float64, 0)
-
 	allPurchaseData = make(AllRoundsPurchaseData)
 	weaponTracker = NewWeaponTracker()
-
 	allC4Holders = make([]C4HolderInfo, 0)
 	allPlayersInfo = make(map[string]*PlayerInfo)
 	allChatMessages = make([]ChatMessage, 0)
+	buttonTickMap = make(map[TickPlayer]int32, 1000)
+	playerLastScopedState = make(map[uint64]bool)
+	recentPickups = make(map[TickPlayer]int)
+	purchasedThisTick = make(map[TickPlayer]int64)
 
-	var buttonTickMap map[TickPlayer]int32 = make(map[TickPlayer]int32)
-	detectActualFrameRate(iParser)
-	var playerLastScopedState map[uint64]bool = make(map[uint64]bool)
-	var playerLastWeapons map[uint64][]string = make(map[uint64][]string)
 	var (
-		roundNum           = 0
-		currentRound       *RoundInfo
-		firstRoundDetected = false
-		gameStarted        = false
+		roundNum     = 0
+		currentRound *RoundInfo
 	)
 
+	// 帧率检测
+	detectActualFrameRate(iParser)
+
+	// FrameDone 每帧处理
 	iParser.RegisterEventHandler(func(e events.FrameDone) {
+		defer func() {
+			if r := recover(); r != nil {
+				return
+			}
+		}()
+
 		gs := iParser.GameState()
-
-		// 检查是否在热身
-		if gs.IsWarmupPeriod() {
-			return
-		}
-
-		// 检查游戏是否已开始
-		if !gameStarted || currentRound == nil || !currentRound.started {
-			return
-		}
-
 		currentTick := gs.IngameTick()
 
-		tPlayers := gs.TeamTerrorists().Members()
-		ctPlayers := gs.TeamCounterTerrorists().Members()
-		Players := append(tPlayers, ctPlayers...)
+		if gs.IsWarmupPeriod() || currentRound == nil {
+			return
+		}
+
+		Players := getAllPlayers(gs)
+		if len(Players) == 0 {
+			return
+		}
+
 		for _, player := range Players {
-			if player != nil {
-				var addonButton int32 = 0
-				key := TickPlayer{currentTick, player.SteamID64}
-				if val, ok := buttonTickMap[key]; ok {
-					addonButton = val
-					delete(buttonTickMap, key)
-				}
+			if player == nil || !player.IsAlive() {
+				continue
+			}
+
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						return
+					}
+				}()
 
 				steamID := player.SteamID64
-				currentScoped := player.IsScoped()
-				lastScoped, exists := playerLastScopedState[steamID]
+				var addonButton int32 = 0
 
-				if !exists {
-					playerLastScopedState[steamID] = currentScoped
-				} else if currentScoped != lastScoped {
-					addonButton |= IN_ATTACK2
+				if val, ok := buttonTickMap[TickPlayer{currentTick, steamID}]; ok {
+					addonButton = val
+					delete(buttonTickMap, TickPlayer{currentTick, steamID})
+				}
+
+				activeWeapon := player.ActiveWeapon()
+				if isSniperRifle(activeWeapon) {
+					currentScoped := player.IsScoped()
+					if lastScoped, exists := playerLastScopedState[steamID]; exists {
+						if currentScoped != lastScoped {
+							addonButton |= IN_ATTACK2
+						}
+					}
 					playerLastScopedState[steamID] = currentScoped
 				}
 
@@ -352,239 +384,252 @@ func Start(filePath string) {
 					addonButton |= IN_USE
 				}
 
-				detectWeaponChanges(player, currentTick, buttonTickMap, playerLastWeapons)
-
 				parsePlayerFrame(player, addonButton, iParser.TickRate(), currentRound.inFreezeTime)
-			}
 
-			if currentRound != nil && currentTick == currentRound.inventoryCheckTime {
-				ilog.InfoLogger.Printf("  [装备验证] 回合 %d 延长验证时间到达 (Tick: %d)",
-					currentRound.roundNum, currentTick)
-				recordAllPlayersInventory(&gs, currentRoundPurchases)
-			}
+				if needInterpolation && len(encoder.PlayerFramesMap[player.Name]) >= 2 {
+					interpolateFrames(player.Name, detectedFrameRate, targetFrameRate, iParser.TickRate())
+				}
+			}()
 		}
 	})
 
-	iParser.RegisterEventHandler(func(e events.ItemDrop) {
-		gs := iParser.GameState()
+	// 武器物品事件
 
-		// 检查是否在热身
-		if gs.IsWarmupPeriod() {
-			return
-		}
-
-		currentTick := gs.IngameTick()
-
-		if e.Player != nil {
-			key := TickPlayer{currentTick, e.Player.SteamID64}
-
-			if e.Weapon != nil {
-				weaponType := e.Weapon.Type
-
-				isGrenade := false
-				switch weaponType {
-				case common.EqFlash, common.EqSmoke, common.EqHE,
-					common.EqMolotov, common.EqIncendiary, common.EqDecoy:
-					isGrenade = true
-				}
-
-				if isGrenade {
-					if _, ok := buttonTickMap[key]; ok {
-						buttonTickMap[key] |= IN_ATTACK
-					} else {
-						buttonTickMap[key] = IN_ATTACK
-					}
-				} else {
-				}
-			}
-		}
-
-		if currentRound == nil || currentRoundPurchases == nil || !currentRound.inFreezeTime {
-			return
-		}
-
-		if e.Player == nil || e.Weapon == nil {
-			return
-		}
-
-		weaponName := getEquipmentName(e.Weapon)
-		if shouldFilterWeapon(weaponName) {
-			return
-		}
-
-		weaponTracker.RegisterDrop(e.Weapon, e.Player.SteamID64)
-
-		dropTime := getAdjustedTime(currentTick-currentRound.freezetimeStart, iParser.TickRate())
-
-		var teamMap map[string]*PlayerPurchaseData
-		if e.Player.Team == common.TeamTerrorists {
-			teamMap = currentRoundPurchases.T
-		} else if e.Player.Team == common.TeamCounterTerrorists {
-			teamMap = currentRoundPurchases.CT
-		} else {
-			return
-		}
-
-		playerName := e.Player.Name
-		if _, exists := teamMap[playerName]; !exists {
-			// 使用新的初始化函数确保玩家只在一个队伍
-			initializePlayerInRound(e.Player, currentRoundPurchases)
-			// 重新获取 teamMap
-			if e.Player.Team == common.TeamTerrorists {
-				teamMap = currentRoundPurchases.T
-			} else {
-				teamMap = currentRoundPurchases.CT
-			}
-		}
-
-		dropRecord := PurchaseRecord{
-			Time:   dropTime,
-			Item:   weaponName,
-			Slot:   getEquipmentSlot(e.Weapon.Type),
-			Action: ActionDrop,
-		}
-		teamMap[playerName].Purchases = append(teamMap[playerName].Purchases, dropRecord)
-	})
-
+	// ItemPickup
 	iParser.RegisterEventHandler(func(e events.ItemPickup) {
 		gs := iParser.GameState()
 
-		// 检查是否在热身
-		if gs.IsWarmupPeriod() {
+		if gs.IsWarmupPeriod() || e.Player == nil || e.Weapon == nil {
+			return
+		}
+
+		currentTick := gs.IngameTick()
+		steamID := e.Player.SteamID64
+		weaponName := getEquipmentName(e.Weapon)
+
+		// 记录拾取的槽位
+		key := TickPlayer{currentTick, steamID}
+		recentPickups[key] = getWeaponSlot(e.Weapon.Type)
+
+		// 判断是购买还是拾起
+		isPurchase := false
+		isPickup := false
+
+		if weaponTracker.IsNewWeapon(e.Weapon) {
+			isPurchase = true
+		} else if weaponTracker.IsPickupFromGround(e.Weapon, steamID) {
+			isPickup = true
+		} else {
+			if isGrenadeType(e.Weapon.Type) {
+				if currentRound != nil && e.Player.IsInBuyZone() {
+					if currentRound.inFreezeTime || currentTick <= currentRound.buyTimeEnd {
+						isPurchase = true
+					}
+				}
+			}
+		}
+
+		// 购买系统记录
+		if currentRound != nil && currentRound.inFreezeTime && !shouldFilterWeapon(weaponName) {
+			if isPurchase || isPickup {
+				dropTime := getAdjustedTime(currentTick-currentRound.freezetimeStart, iParser.TickRate())
+
+				var teamMap map[string]*PlayerPurchaseData
+				if e.Player.Team == common.TeamTerrorists {
+					teamMap = currentRoundPurchases.T
+				} else if e.Player.Team == common.TeamCounterTerrorists {
+					teamMap = currentRoundPurchases.CT
+				}
+
+				if teamMap != nil {
+					playerName := e.Player.Name
+					if _, exists := teamMap[playerName]; !exists {
+						initializePlayerInRound(e.Player, currentRoundPurchases)
+						if e.Player.Team == common.TeamTerrorists {
+							teamMap = currentRoundPurchases.T
+						} else {
+							teamMap = currentRoundPurchases.CT
+						}
+					}
+
+					action := ActionPickup
+					if isPurchase {
+						action = ActionPurchase
+						key := TickPlayer{currentTick, steamID}
+						purchasedThisTick[key] = e.Weapon.UniqueID()
+					}
+
+					record := PurchaseRecord{
+						Time:   dropTime,
+						Item:   weaponName,
+						Slot:   getEquipmentSlot(e.Weapon.Type),
+						Action: action,
+					}
+					teamMap[playerName].Purchases = append(teamMap[playerName].Purchases, record)
+				}
+			}
+		}
+
+		// 拾起USE键
+		if isPickup && e.Player.IsAlive() {
+			pickupKey := TickPlayer{currentTick, steamID}
+			if existingButtons, ok := buttonTickMap[pickupKey]; ok {
+				buttonTickMap[pickupKey] = existingButtons | IN_USE
+			} else {
+				buttonTickMap[pickupKey] = IN_USE
+			}
+		}
+	})
+
+	// ItemDrop
+	iParser.RegisterEventHandler(func(e events.ItemDrop) {
+		gs := iParser.GameState()
+
+		if gs.IsWarmupPeriod() || e.Player == nil || e.Weapon == nil {
 			return
 		}
 
 		currentTick := gs.IngameTick()
 
-		if e.Player != nil && e.Weapon != nil {
-			weaponName := getEquipmentName(e.Weapon)
-
-			if !shouldFilterWeapon(weaponName) {
-				key := TickPlayer{currentTick, e.Player.SteamID64}
-
-				if _, ok := buttonTickMap[key]; ok {
-					buttonTickMap[key] |= IN_USE
-				} else {
-					buttonTickMap[key] = IN_USE
-				}
-
-				if currentRound != nil && !currentRound.inFreezeTime {
-				}
-			}
-		}
-
-		if currentRound == nil || currentRoundPurchases == nil {
+		// 回合开始1秒内不记录丢弃
+		if currentRound != nil && currentTick < currentRound.dropAllowedTick {
 			return
 		}
-
-		if e.Player == nil || e.Weapon == nil {
-			return
-		}
-
-		// 检查是否在购买时间内 (冻结时间+)
-		inBuyTime := currentRound.inFreezeTime || currentTick <= currentRound.buyTimeEnd
-
-		if !inBuyTime {
-			return
-		}
-
+		weaponType := e.Weapon.Type
+		steamID := e.Player.SteamID64
 		weaponName := getEquipmentName(e.Weapon)
 
-		if shouldFilterWeapon(weaponName) {
+		if isGrenadeType(weaponType) {
 			return
 		}
 
-		actionTime := getAdjustedTime(currentTick-currentRound.freezetimeStart, iParser.TickRate())
+		// 仅冻结时间购买追踪
+		if currentRound != nil && currentRound.inFreezeTime && !shouldFilterWeapon(weaponName) {
+			// 检查是否为新武器（RegisterDrop之前）
+			isNewWeapon := weaponTracker.IsNewWeapon(e.Weapon)
 
-		var teamMap map[string]*PlayerPurchaseData
-		if e.Player.Team == common.TeamTerrorists {
-			teamMap = currentRoundPurchases.T
-		} else if e.Player.Team == common.TeamCounterTerrorists {
-			teamMap = currentRoundPurchases.CT
-		} else {
-			return
-		}
+			weaponTracker.RegisterDrop(e.Weapon, steamID)
 
-		playerName := e.Player.Name
-		if _, exists := teamMap[playerName]; !exists {
-			// 使用新的初始化函数确保玩家只在一个队伍
-			initializePlayerInRound(e.Player, currentRoundPurchases)
-			// 重新获取 teamMap
+			dropTime := getAdjustedTime(currentTick-currentRound.freezetimeStart, iParser.TickRate())
+
+			var teamMap map[string]*PlayerPurchaseData
 			if e.Player.Team == common.TeamTerrorists {
 				teamMap = currentRoundPurchases.T
-			} else {
+			} else if e.Player.Team == common.TeamCounterTerrorists {
 				teamMap = currentRoundPurchases.CT
+			}
+
+			if teamMap != nil {
+				playerName := e.Player.Name
+				if _, exists := teamMap[playerName]; !exists {
+					initializePlayerInRound(e.Player, currentRoundPurchases)
+					if e.Player.Team == common.TeamTerrorists {
+						teamMap = currentRoundPurchases.T
+					} else {
+						teamMap = currentRoundPurchases.CT
+					}
+				}
+
+				// 判断是否为购买丢弃
+				action := ActionDrop
+				if isNewWeapon && e.Player.IsInBuyZone() {
+					action = ActionBuyDrop
+				}
+
+				dropRecord := PurchaseRecord{
+					Time:   dropTime,
+					Item:   weaponName,
+					Slot:   getEquipmentSlot(e.Weapon.Type),
+					Action: action,
+				}
+				teamMap[playerName].Purchases = append(teamMap[playerName].Purchases, dropRecord)
 			}
 		}
 
-		var action ItemAction
+		// 丢弃类型的判断
 
-		isPurchase := weaponTracker.IsPurchase(e.Weapon, e.Player.SteamID64)
-		isPickup := false
+		// 检查是否生成按键
+		if e.Player.IsAlive() {
+			key := TickPlayer{currentTick, steamID}
+			droppedWeaponSlot := getWeaponSlot(weaponType)
 
-		if !isPurchase {
-			isPickup = weaponTracker.IsPickup(e.Weapon, e.Player.SteamID64)
+			// 检查同一tick是否拾取了同槽位武器（自动替换）
+			isAutoReplace := false
+			if pickedSlot, exists := recentPickups[key]; exists {
+				if pickedSlot == droppedWeaponSlot {
+					isAutoReplace = true
+				}
+			}
+
+			// 检查是否为购买丢弃（Ctrl+购买）
+			isBuyDrop := false
+			if !isAutoReplace && weaponTracker.IsNewWeapon(e.Weapon) {
+				if e.Player.IsInBuyZone() && currentRound != nil {
+					if currentRound.inFreezeTime || currentTick <= currentRound.buyTimeEnd {
+						isBuyDrop = true
+					}
+				}
+			}
+
+			// 只有手动丢弃才生成按键
+			if !isAutoReplace && !isBuyDrop {
+				dropButton := encodeDropButton(droppedWeaponSlot)
+
+				if existingButtons, ok := buttonTickMap[key]; ok {
+					buttonTickMap[key] = existingButtons | dropButton
+				} else {
+					buttonTickMap[key] = dropButton
+				}
+			}
 		}
-
-		if isPurchase {
-			action = ActionPurchase
-		} else if isPickup {
-			action = ActionPickup
-		} else {
-			return
-		}
-
-		purchase := PurchaseRecord{
-			Time:   actionTime,
-			Item:   weaponName,
-			Slot:   getEquipmentSlot(e.Weapon.Type),
-			Action: action,
-		}
-		teamMap[playerName].Purchases = append(teamMap[playerName].Purchases, purchase)
 	})
 
+	// WeaponFire
 	iParser.RegisterEventHandler(func(e events.WeaponFire) {
 		gs := iParser.GameState()
 
-		// 检查是否在热身
-		if gs.IsWarmupPeriod() {
+		if gs.IsWarmupPeriod() || e.Shooter == nil {
 			return
 		}
 
 		currentTick := gs.IngameTick()
-		key := TickPlayer{currentTick, e.Shooter.SteamID64}
-		if _, ok := buttonTickMap[key]; ok {
-			buttonTickMap[key] |= IN_ATTACK
+		steamID := e.Shooter.SteamID64
+		key := TickPlayer{currentTick, steamID}
+
+		if existingButtons, ok := buttonTickMap[key]; ok {
+			buttonTickMap[key] = existingButtons | IN_ATTACK
 		} else {
 			buttonTickMap[key] = IN_ATTACK
 		}
 	})
 
+	// PlayerJump
 	iParser.RegisterEventHandler(func(e events.PlayerJump) {
 		gs := iParser.GameState()
 
-		// 检查是否在热身
-		if gs.IsWarmupPeriod() {
+		if gs.IsWarmupPeriod() || e.Player == nil {
 			return
 		}
 
 		currentTick := gs.IngameTick()
 		key := TickPlayer{currentTick, e.Player.SteamID64}
-		if _, ok := buttonTickMap[key]; ok {
-			buttonTickMap[key] |= IN_JUMP
+
+		if existingButtons, ok := buttonTickMap[key]; ok {
+			buttonTickMap[key] = existingButtons | IN_JUMP
 		} else {
 			buttonTickMap[key] = IN_JUMP
 		}
 	})
 
+	// USE事件
+
+	// 拆弹开始
 	iParser.RegisterEventHandler(func(e events.BombDefuseStart) {
 		if e.Player == nil {
 			return
 		}
 
 		gs := iParser.GameState()
-
-		// 检查是否在热身
 		if gs.IsWarmupPeriod() {
 			return
 		}
@@ -592,60 +637,20 @@ func Start(filePath string) {
 		currentTick := gs.IngameTick()
 		key := TickPlayer{currentTick, e.Player.SteamID64}
 
-		if _, ok := buttonTickMap[key]; ok {
-			buttonTickMap[key] |= IN_USE
+		if existingButtons, ok := buttonTickMap[key]; ok {
+			buttonTickMap[key] = existingButtons | IN_USE
 		} else {
 			buttonTickMap[key] = IN_USE
 		}
-
-		ilog.InfoLogger.Printf("  [拆弹开始] %s 开始拆弹 (Tick: %d)",
-			e.Player.Name, currentTick)
 	})
 
-	iParser.RegisterEventHandler(func(e events.BombDefuseAborted) {
-		if e.Player == nil {
-			return
-		}
-
-		gs := iParser.GameState()
-
-		// 检查是否在热身
-		if gs.IsWarmupPeriod() {
-			return
-		}
-
-		currentTick := gs.IngameTick()
-
-		ilog.InfoLogger.Printf("  [拆弹中止] %s (Tick: %d)",
-			e.Player.Name, currentTick)
-	})
-
-	iParser.RegisterEventHandler(func(e events.BombDefused) {
-		if e.Player == nil {
-			return
-		}
-
-		gs := iParser.GameState()
-
-		// 检查是否在热身
-		if gs.IsWarmupPeriod() {
-			return
-		}
-
-		currentTick := gs.IngameTick()
-
-		ilog.InfoLogger.Printf("  [拆弹完成] %s 成功拆除炸弹 (Tick: %d)",
-			e.Player.Name, currentTick)
-	})
-
+	// 安装炸弹
 	iParser.RegisterEventHandler(func(e events.BombPlantBegin) {
 		if e.Player == nil {
 			return
 		}
 
 		gs := iParser.GameState()
-
-		// 检查是否在热身
 		if gs.IsWarmupPeriod() {
 			return
 		}
@@ -653,79 +658,183 @@ func Start(filePath string) {
 		currentTick := gs.IngameTick()
 		key := TickPlayer{currentTick, e.Player.SteamID64}
 
-		if _, ok := buttonTickMap[key]; ok {
-			buttonTickMap[key] |= IN_USE
+		if existingButtons, ok := buttonTickMap[key]; ok {
+			buttonTickMap[key] = existingButtons | IN_USE
 		} else {
 			buttonTickMap[key] = IN_USE
 		}
-
-		ilog.InfoLogger.Printf("  [埋弹开始] %s 开始埋弹 (Tick: %d)",
-			e.Player.Name, currentTick)
 	})
 
-	iParser.RegisterEventHandler(func(e events.BombPlantAborted) {
+	// 救援人质
+	iParser.RegisterEventHandler(func(e events.HostageRescued) {
 		if e.Player == nil {
 			return
 		}
 
 		gs := iParser.GameState()
-
-		// 检查是否在热身
 		if gs.IsWarmupPeriod() {
 			return
 		}
 
 		currentTick := gs.IngameTick()
+		key := TickPlayer{currentTick, e.Player.SteamID64}
 
-		ilog.InfoLogger.Printf("  [埋弹中止] %s (Tick: %d)",
-			e.Player.Name, currentTick)
+		if existingButtons, ok := buttonTickMap[key]; ok {
+			buttonTickMap[key] = existingButtons | IN_USE
+		} else {
+			buttonTickMap[key] = IN_USE
+		}
 	})
 
-	iParser.RegisterEventHandler(func(e events.BombPlanted) {
-		if e.Player == nil {
+	// 回合事件
+
+	// RoundStart
+	iParser.RegisterEventHandler(func(e events.RoundStart) {
+		gs := iParser.GameState()
+		currentTick := gs.IngameTick()
+
+		if gs.IsWarmupPeriod() {
 			return
 		}
 
+		roundNum = gs.TotalRoundsPlayed() + 1
+
+		ilog.InfoLogger.Printf("====================================")
+		ilog.InfoLogger.Printf("回合 %d 开始", roundNum)
+
+		tickRate := iParser.TickRate()
+		dropDelayTicks := int(tickRate * 1.0)
+
+		currentRound = &RoundInfo{
+			roundNum:        roundNum,
+			freezetimeStart: currentTick,
+			freezetimeEnd:   currentTick,
+			inFreezeTime:    true,
+			isHalftime:      false,
+			started:         true,
+			dropAllowedTick: currentTick + dropDelayTicks,
+		}
+
+		currentRoundPurchases = &RoundPurchaseData{
+			T:  make(map[string]*PlayerPurchaseData),
+			CT: make(map[string]*PlayerPurchaseData),
+		}
+		allPurchaseData[fmt.Sprintf("round%d", roundNum)] = currentRoundPurchases
+
+		weaponTracker = NewWeaponTracker()
+		playerLastScopedState = make(map[uint64]bool)
+
+		Players := getAllPlayers(gs)
+		for _, player := range Players {
+			if player != nil {
+				parsePlayerInitFrame(player)
+				recordPlayerStartMoney(player, roundNum)
+				recordPlayerInfo(player)
+				initializePlayerInRound(player, currentRoundPurchases)
+			}
+		}
+
+		ilog.InfoLogger.Printf("  已初始化 %d 名玩家", len(Players))
+	})
+
+	// RoundFreezetimeEnd
+	iParser.RegisterEventHandler(func(e events.RoundFreezetimeEnd) {
 		gs := iParser.GameState()
 
-		// 检查是否在热身
 		if gs.IsWarmupPeriod() {
 			return
 		}
 
-		currentTick := gs.IngameTick()
+		if currentRound != nil {
+			currentTick := gs.IngameTick()
 
-		siteName := "未知"
-		switch e.Site {
-		case events.BombsiteA:
-			siteName = "A点"
-		case events.BombsiteB:
-			siteName = "B点"
+			currentRound.freezetimeEnd = currentTick
+			currentRound.inFreezeTime = false
+
+			tickRate := iParser.TickRate()
+			extendTicks := int(tickRate * 20)
+			currentRound.buyTimeEnd = currentTick + extendTicks
+
+			ilog.InfoLogger.Printf("回合 %d 冻结时间结束", currentRound.roundNum)
+
+			recordPlayersGrenades(&gs, currentRoundPurchases)
+			recordPlayerSpawns(&gs, currentRound.roundNum)
+			detectC4Holder(&gs, currentRound.roundNum)
 		}
-
-		ilog.InfoLogger.Printf("  [埋弹完成] %s 成功放置炸弹于 %s (Tick: %d)",
-			e.Player.Name, siteName, currentTick)
 	})
 
+	// RoundEnd
+	iParser.RegisterEventHandler(func(e events.RoundEnd) {
+		gs := iParser.GameState()
+		currentTick := gs.IngameTick()
+
+		if gs.IsWarmupPeriod() {
+			currentRound = nil
+			return
+		}
+
+		if currentRound == nil {
+			ilog.InfoLogger.Printf("收到 RoundEnd 但 currentRound 为 nil")
+			return
+		}
+
+		currentRound.roundEnd = currentTick
+		freezeDuration := getAdjustedTime(currentRound.freezetimeEnd-currentRound.freezetimeStart, iParser.TickRate())
+
+		ilog.InfoLogger.Printf("回合 %d 结束", currentRound.roundNum)
+
+		if currentRound.isHalftime {
+			freezeInfo := fmt.Sprintf("HALFTIME:%d", currentRound.roundNum)
+			allRoundsFreezeInfo = append(allRoundsFreezeInfo, freezeInfo)
+		} else {
+			freezeInfo := fmt.Sprintf("round%d: %.2f秒", currentRound.roundNum, freezeDuration)
+			allRoundsFreezeInfo = append(allRoundsFreezeInfo, freezeInfo)
+			allFreezeDurations = append(allFreezeDurations, freezeDuration)
+		}
+
+		adjustMoneyForInitialInventory(currentRoundPurchases, currentRound.roundNum)
+
+		Players := getAllPlayers(gs)
+		savedCount := 0
+		for _, player := range Players {
+			if player != nil {
+				frameCount := len(encoder.PlayerFramesMap[player.Name])
+				if frameCount == 0 {
+					continue
+				}
+				saveToRecFile(player, int32(currentRound.roundNum))
+				savedCount++
+			}
+		}
+
+		ilog.InfoLogger.Printf("  已保存 %d 个玩家录像到: %s/round%d/", savedCount, outputBaseDir, currentRound.roundNum)
+
+		buttonTickMap = make(map[TickPlayer]int32, 1000)
+		recentPickups = make(map[TickPlayer]int)
+		purchasedThisTick = make(map[TickPlayer]int64)
+
+		ilog.InfoLogger.Printf("  已清理按键映射和临时数据")
+
+		currentRound = nil
+	})
+
+	// GameHalfEnded 半场结束
 	iParser.RegisterEventHandler(func(e events.GameHalfEnded) {
 		gs := iParser.GameState()
 
-		// 检查是否在热身
 		if gs.IsWarmupPeriod() {
 			return
 		}
 
 		if currentRound != nil {
 			currentRound.isHalftime = true
-			ilog.InfoLogger.Printf("半场结束,回合 %d 包含换边时间", currentRound.roundNum)
 		}
 	})
 
-	// 聊天消息处理
+	// ChatMessage 聊天消息
 	iParser.RegisterEventHandler(func(e events.ChatMessage) {
 		gs := iParser.GameState()
 
-		// 检查是否在热身
 		if gs.IsWarmupPeriod() {
 			return
 		}
@@ -740,7 +849,7 @@ func Start(filePath string) {
 		teamName := "Unknown"
 		var sender *common.Player
 
-		allPlayers := append(gs.TeamTerrorists().Members(), gs.TeamCounterTerrorists().Members()...)
+		allPlayers := getAllPlayers(gs)
 		for _, player := range allPlayers {
 			if player != nil && player.Name == e.Sender.Name {
 				sender = player
@@ -771,187 +880,6 @@ func Start(filePath string) {
 		}
 
 		allChatMessages = append(allChatMessages, chatMsg)
-
-		chatType := "全体"
-		if chatMsg.IsTeamChat {
-			chatType = "队伍"
-		}
-
-		ilog.InfoLogger.Printf("  [聊天-%s] 回合%d %.2f秒 - %s (%s): %s",
-			chatType, currentRound.roundNum, chatTime, e.Sender.Name, teamName, e.Text)
-	})
-
-	iParser.RegisterEventHandler(func(e events.RoundStart) {
-		gs := iParser.GameState()
-		currentTick := gs.IngameTick()
-
-		// 检查热身状态
-		if gs.IsWarmupPeriod() {
-			ilog.InfoLogger.Printf("跳过热身回合 (Tick: %d)", currentTick)
-			if gameStarted {
-				ilog.InfoLogger.Printf("⚠ 检测到重新进入热身，重置游戏状态")
-				gameStarted = false
-				firstRoundDetected = false
-				roundNum = 0
-				currentRound = nil
-			}
-			return
-		}
-
-		// 如果当前回合还存在且已开始，不处理新的 RoundStart
-		if currentRound != nil && currentRound.started {
-			ilog.InfoLogger.Printf("⚠ 检测到重复的 RoundStart 事件 (Tick: %d)，当前回合 %d 还未结束，跳过", currentTick, currentRound.roundNum)
-			return
-		}
-
-		if !firstRoundDetected {
-			firstRoundDetected = true
-			gameStarted = true
-			roundNum = 1
-			ilog.InfoLogger.Printf("检测到第一个正式回合开始")
-		} else {
-			roundNum++
-		}
-
-		if currentRound != nil && currentRound.roundNum == roundNum {
-			ilog.InfoLogger.Printf("回合 %d 已初始化,跳过重复初始化", roundNum)
-			return
-		}
-
-		ilog.InfoLogger.Printf("====================================")
-		ilog.InfoLogger.Printf("回合 %d 开始 (Tick: %d)", roundNum, currentTick)
-
-		currentRound = &RoundInfo{
-			roundNum:        roundNum,
-			freezetimeStart: currentTick,
-			freezetimeEnd:   currentTick,
-			inFreezeTime:    true,
-			isHalftime:      false,
-			started:         false,
-		}
-
-		currentRoundPurchases = &RoundPurchaseData{
-			T:  make(map[string]*PlayerPurchaseData),
-			CT: make(map[string]*PlayerPurchaseData),
-		}
-		allPurchaseData[fmt.Sprintf("round%d", roundNum)] = currentRoundPurchases
-
-		weaponTracker = NewWeaponTracker()
-
-		playerLastScopedState = make(map[uint64]bool)
-		playerLastWeapons = make(map[uint64][]string)
-		tPlayers := gs.TeamTerrorists().Members()
-		ctPlayers := gs.TeamCounterTerrorists().Members()
-		Players := append(tPlayers, ctPlayers...)
-
-		for _, player := range Players {
-			if player != nil {
-				parsePlayerInitFrame(player)
-				recordPlayerStartMoney(player, roundNum)
-				recordPlayerInfo(player)
-
-				// 使用新的初始化函数
-				initializePlayerInRound(player, currentRoundPurchases)
-			}
-		}
-
-		currentRound.started = true
-	})
-
-	iParser.RegisterEventHandler(func(e events.RoundFreezetimeEnd) {
-		gs := iParser.GameState()
-
-		// 检查是否在热身
-		if gs.IsWarmupPeriod() {
-			return
-		}
-
-		if currentRound != nil {
-			currentTick := gs.IngameTick()
-
-			currentRound.freezetimeEnd = currentTick
-			currentRound.inFreezeTime = false
-
-			// 设置延长时间
-			tickRate := iParser.TickRate()
-			extendTicks := int(tickRate * 10)
-			currentRound.buyTimeEnd = currentTick + extendTicks
-			currentRound.inventoryCheckTime = currentTick + extendTicks
-
-			freezeDuration := getAdjustedTime(currentTick-currentRound.freezetimeStart, iParser.TickRate())
-			ilog.InfoLogger.Printf("回合 %d 冻结时间结束 (Tick: %d, 持续: %.2f秒)",
-				currentRound.roundNum, currentTick, freezeDuration)
-			ilog.InfoLogger.Printf("  购买时间延长至: Tick %d (+10秒)", currentRound.buyTimeEnd)
-
-			recordPlayersGrenades(&gs, currentRoundPurchases)
-			detectC4Holder(&gs, currentRound.roundNum)
-		}
-	})
-
-	iParser.RegisterEventHandler(func(e events.RoundEnd) {
-		gs := iParser.GameState()
-
-		if gs.IsWarmupPeriod() {
-			ilog.InfoLogger.Printf("⚠  回合结束时检测到热身状态，跳过保存")
-			currentRound = nil
-			return
-		}
-
-		if !gameStarted {
-			ilog.InfoLogger.Printf("⚠  游戏未开始，跳过回合结束处理")
-			currentRound = nil
-			return
-		}
-
-		if currentRound != nil {
-			currentTick := gs.IngameTick()
-			currentRound.roundEnd = currentTick
-
-			freezeDuration := getAdjustedTime(currentRound.freezetimeEnd-currentRound.freezetimeStart, iParser.TickRate())
-
-			ilog.InfoLogger.Printf("回合 %d 结束 (Tick: %d)", currentRound.roundNum, currentTick)
-
-			if currentRound.isHalftime {
-				ilog.InfoLogger.Printf("  ⚠  半场换边回合,冻结时间将使用最常见值")
-				freezeInfo := fmt.Sprintf("HALFTIME:%d", currentRound.roundNum)
-				allRoundsFreezeInfo = append(allRoundsFreezeInfo, freezeInfo)
-			} else {
-				ilog.InfoLogger.Printf("  冻结时间: %.2f秒", freezeDuration)
-				freezeInfo := fmt.Sprintf("round%d: %.2f秒", currentRound.roundNum, freezeDuration)
-				allRoundsFreezeInfo = append(allRoundsFreezeInfo, freezeInfo)
-				allFreezeDurations = append(allFreezeDurations, freezeDuration)
-			}
-
-			printPurchaseStats(currentRoundPurchases, currentRound.roundNum)
-			adjustMoneyForFinalInventory(currentRoundPurchases, currentRound.roundNum)
-
-			tPlayers := gs.TeamTerrorists().Members()
-			ctPlayers := gs.TeamCounterTerrorists().Members()
-			Players := append(tPlayers, ctPlayers...)
-
-			ilog.InfoLogger.Printf("  正在保存录像文件...")
-			savedCount := 0
-
-			for _, player := range Players {
-				if player != nil {
-					// 如果需要插帧，先进行插帧
-					if shouldInterpolate {
-						interpolatePlayerFrames(player.Name)
-					}
-					saveToRecFile(player, int32(currentRound.roundNum))
-					savedCount++
-				}
-			}
-
-			if shouldInterpolate {
-				ilog.InfoLogger.Printf("  ✓ 已对所有玩家进行插帧优化")
-			}
-
-			ilog.InfoLogger.Printf("  已保存 %d 个玩家录像到: %s/round%d/", savedCount, outputBaseDir, currentRound.roundNum)
-			ilog.InfoLogger.Printf("====================================\n")
-
-			currentRound = nil
-		}
 	})
 
 	err = iParser.ParseToEnd()
@@ -960,7 +888,6 @@ func Start(filePath string) {
 	saveFreezeTimeInfo()
 
 	ilog.InfoLogger.Println("\n开始保存购买数据...")
-
 	for roundKey, roundData := range allPurchaseData {
 		tTotal := 0
 		ctTotal := 0
@@ -977,7 +904,8 @@ func Start(filePath string) {
 	if err != nil {
 		ilog.ErrorLogger.Printf("保存购买数据失败: %s\n", err.Error())
 	} else {
-		ilog.InfoLogger.Printf("购买数据已保存到: %s/purchases.json", outputBaseDir)
+		ilog.InfoLogger.Printf("购买数据已保存到: %s/purchases.json (优化版)", outputBaseDir)
+		ilog.InfoLogger.Printf("原始购买数据已保存到: %s/purchases_raw.json", outputBaseDir)
 	}
 
 	ilog.InfoLogger.Println("\n开始保存金钱数据...")
@@ -1013,74 +941,17 @@ func Start(filePath string) {
 		ilog.InfoLogger.Printf("共记录 %d 条聊天消息", len(allChatMessages))
 	}
 
+	ilog.InfoLogger.Println("\n开始保存出生点数据...")
+	err = saveSpawnData()
+	if err != nil {
+		ilog.ErrorLogger.Printf("保存出生点数据失败: %s\n", err.Error())
+	} else {
+		ilog.InfoLogger.Printf("出生点数据已保存到: %s/spawns.json", outputBaseDir)
+		ilog.InfoLogger.Printf("共记录 %d 个回合的出生点", len(allRoundsSpawns))
+	}
+
 	ilog.InfoLogger.Printf("\n解析完成!所有回合录像已保存到 %s/ 目录", outputBaseDir)
 	ilog.InfoLogger.Printf("共解析 %d 个回合\n", roundNum)
-}
-
-func recordAllPlayersInventory(gs *dem.GameState, roundPurchases *RoundPurchaseData) {
-	tPlayers := (*gs).TeamTerrorists().Members()
-	ctPlayers := (*gs).TeamCounterTerrorists().Members()
-	allPlayers := append(tPlayers, ctPlayers...)
-
-	for _, player := range allPlayers {
-		if player == nil {
-			continue
-		}
-
-		var teamMap map[string]*PlayerPurchaseData
-		if player.Team == common.TeamTerrorists {
-			teamMap = roundPurchases.T
-		} else if player.Team == common.TeamCounterTerrorists {
-			teamMap = roundPurchases.CT
-		} else {
-			continue
-		}
-
-		playerName := player.Name
-		if _, exists := teamMap[playerName]; !exists {
-			teamMap[playerName] = &PlayerPurchaseData{
-				Purchases:      []PurchaseRecord{},
-				FinalInventory: []string{},
-			}
-		}
-
-		teamMap[playerName].FinalInventory = getFinalInventory(player)
-	}
-}
-
-func printPurchaseStats(roundPurchases *RoundPurchaseData, roundNum int) {
-	ilog.InfoLogger.Printf("  [回合 %d 装备变动统计]", roundNum)
-
-	tCount := 0
-	for playerName, data := range roundPurchases.T {
-		if len(data.Purchases) > 0 || len(data.FinalInventory) > 0 {
-			tCount++
-			ilog.InfoLogger.Printf("    T - %s: %d 次操作, 最终装备 %v",
-				playerName, len(data.Purchases), data.FinalInventory)
-		}
-	}
-
-	ctCount := 0
-	for playerName, data := range roundPurchases.CT {
-		if len(data.Purchases) > 0 || len(data.FinalInventory) > 0 {
-			ctCount++
-			ilog.InfoLogger.Printf("    CT - %s: %d 次操作, 最终装备 %v",
-				playerName, len(data.Purchases), data.FinalInventory)
-		}
-	}
-
-	ilog.InfoLogger.Printf("  T方: %d 名玩家, CT方: %d 名玩家", tCount, ctCount)
-}
-
-func getTeamName(team common.Team) string {
-	switch team {
-	case common.TeamTerrorists:
-		return "T"
-	case common.TeamCounterTerrorists:
-		return "CT"
-	default:
-		return "Unknown"
-	}
 }
 
 func saveFreezeTimeInfo() {
@@ -1142,7 +1013,7 @@ func getMostCommonFreezeDuration() float64 {
 }
 
 func detectC4Holder(gs *dem.GameState, roundNum int) {
-	tPlayers := (*gs).TeamTerrorists().Members()
+	tPlayers, _ := getTeamPlayers(*gs)
 
 	for _, player := range tPlayers {
 		if player == nil {
@@ -1156,15 +1027,10 @@ func detectC4Holder(gs *dem.GameState, roundNum int) {
 					PlayerName: player.Name,
 				}
 				allC4Holders = append(allC4Holders, c4Info)
-
-				ilog.InfoLogger.Printf("  [C4检测] 回合 %d: %s 持有C4",
-					roundNum, player.Name)
 				return
 			}
 		}
 	}
-
-	ilog.InfoLogger.Printf("  [C4检测] ⚠ 回合 %d: 未检测到C4持有者", roundNum)
 }
 
 func recordPlayerInfo(player *common.Player) {
@@ -1225,11 +1091,58 @@ func saveChatData() error {
 	return os.WriteFile(chatFile, data, 0644)
 }
 
-// 只记录玩家的手雷（在冻结时间结束时调用）
+func saveSpawnData() error {
+	spawnFile := filepath.Join(outputBaseDir, "spawns.json")
+
+	tSpawns := make(map[string]bool)
+	ctSpawns := make(map[string]bool)
+
+	for _, roundData := range allRoundsSpawns {
+		for _, spawn := range roundData.Spawns {
+			if spawn.Team == "T" {
+				tSpawns[spawn.Position] = true
+			} else if spawn.Team == "CT" {
+				ctSpawns[spawn.Position] = true
+			}
+		}
+	}
+
+	tList := make([]string, 0, len(tSpawns))
+	for pos := range tSpawns {
+		tList = append(tList, pos)
+	}
+	sort.Strings(tList)
+
+	ctList := make([]string, 0, len(ctSpawns))
+	for pos := range ctSpawns {
+		ctList = append(ctList, pos)
+	}
+	sort.Strings(ctList)
+
+	output := map[string]interface{}{
+		"rounds": allRoundsSpawns,
+		"summary": map[string]interface{}{
+			"T": map[string]interface{}{
+				"count":     len(tList),
+				"positions": tList,
+			},
+			"CT": map[string]interface{}{
+				"count":     len(ctList),
+				"positions": ctList,
+			},
+		},
+	}
+
+	data, err := json.MarshalIndent(output, "", "  ")
+	if err != nil {
+		return fmt.Errorf("JSON序列化失败: %w", err)
+	}
+
+	return os.WriteFile(spawnFile, data, 0644)
+}
+
 func recordPlayersGrenades(gs *dem.GameState, roundPurchases *RoundPurchaseData) {
-	tPlayers := (*gs).TeamTerrorists().Members()
-	ctPlayers := (*gs).TeamCounterTerrorists().Members()
-	allPlayers := append(tPlayers, ctPlayers...)
+	allPlayers := getAllPlayers(*gs)
 
 	for _, player := range allPlayers {
 		if player == nil {
@@ -1246,33 +1159,110 @@ func recordPlayersGrenades(gs *dem.GameState, roundPurchases *RoundPurchaseData)
 		}
 
 		playerName := player.Name
+
 		if _, exists := teamMap[playerName]; !exists {
 			teamMap[playerName] = &PlayerPurchaseData{
+				InitialInventory:      []string{},
 				Purchases:             []PurchaseRecord{},
-				FinalInventory:        []string{},
-				FreezetimeEndGrenades: []string{}, // 新字段
+				FreezetimeEndGrenades: []string{},
 			}
 		}
 
-		// 只记录手雷
 		grenades := []string{}
 		for _, weapon := range player.Weapons() {
 			if weapon != nil {
 				weaponName := getEquipmentName(weapon)
-				// 检查是否是手雷
-				switch weapon.Type {
-				case common.EqFlash, common.EqSmoke, common.EqHE,
-					common.EqMolotov, common.EqIncendiary, common.EqDecoy:
+				if isGrenadeType(weapon.Type) {
 					grenades = append(grenades, weaponName)
 				}
 			}
 		}
 
 		teamMap[playerName].FreezetimeEndGrenades = grenades
-
-		if len(grenades) > 0 {
-			ilog.InfoLogger.Printf("    [道具验证] %s - %s: %v",
-				getTeamName(player.Team), playerName, grenades)
-		}
 	}
+}
+
+func recordPlayerSpawns(gs *dem.GameState, roundNum int) {
+	allPlayers := getAllPlayers(*gs)
+
+	spawns := make([]SpawnPosition, 0, len(allPlayers))
+
+	for _, player := range allPlayers {
+		if player == nil || !player.IsAlive() {
+			continue
+		}
+
+		pos := player.Position()
+		teamName := ""
+		switch player.Team {
+		case common.TeamTerrorists:
+			teamName = "T"
+		case common.TeamCounterTerrorists:
+			teamName = "CT"
+		default:
+			continue
+		}
+
+		spawn := SpawnPosition{
+			PlayerName: player.Name,
+			Team:       teamName,
+			Position:   fmt.Sprintf("%.1f %.1f %.1f", pos.X, pos.Y, pos.Z),
+		}
+
+		spawns = append(spawns, spawn)
+	}
+
+	roundSpawn := RoundSpawnData{
+		Round:  roundNum,
+		Spawns: spawns,
+	}
+
+	allRoundsSpawns = append(allRoundsSpawns, roundSpawn)
+
+	ilog.InfoLogger.Printf("  记录了 %d 个玩家的出生位置", len(spawns))
+}
+
+func getWeaponSlot(eqType common.EquipmentType) int {
+	switch eqType {
+	case common.EqMP7, common.EqMP9, common.EqMP5, common.EqUMP,
+		common.EqP90, common.EqBizon, common.EqMac10,
+		common.EqAK47, common.EqM4A4, common.EqM4A1, common.EqGalil,
+		common.EqFamas, common.EqAUG, common.EqSG556,
+		common.EqAWP, common.EqScout, common.EqScar20, common.EqG3SG1,
+		common.EqXM1014, common.EqMag7, common.EqSawedOff, common.EqNova,
+		common.EqM249, common.EqNegev:
+		return 0
+
+	case common.EqP2000, common.EqGlock, common.EqP250, common.EqDeagle,
+		common.EqFiveSeven, common.EqTec9, common.EqCZ, common.EqUSP,
+		common.EqRevolver, common.EqDualBerettas:
+		return 1
+
+	case common.EqKnife:
+		return 2
+
+	case common.EqFlash, common.EqSmoke, common.EqHE,
+		common.EqMolotov, common.EqIncendiary, common.EqDecoy:
+		return 3
+
+	case common.EqBomb:
+		return 4
+
+	case common.EqZeus, common.EqDefuseKit:
+		return 5
+
+	default:
+		return -1
+	}
+}
+
+func encodeDropButton(slot int) int32 {
+	var slotEncoded int32
+	if slot >= 0 {
+		slotEncoded = int32(slot + 1)
+	} else {
+		slotEncoded = 0
+	}
+
+	return int32(uint32(IN_DROP) | (uint32(slotEncoded) << 27))
 }

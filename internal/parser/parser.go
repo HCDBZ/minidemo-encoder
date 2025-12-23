@@ -46,6 +46,7 @@ type RoundInfo struct {
 	started         bool
 	buyTimeEnd      int
 	dropAllowedTick int
+	recordStartTick int
 }
 
 type C4HolderInfo struct {
@@ -105,7 +106,22 @@ var (
 	recentPickups map[TickPlayer]int
 
 	purchasedThisTick map[TickPlayer]int64
+	recordMode        string  = "late_start" // late_start full
+	lateStartOffset   float64 = 1.0
+
+	allRoundsStartPositions RoundStartPositions
 )
+
+// 录制开始位置数据
+type PlayerStartPosition struct {
+	PlayerName string     `json:"player_name"`
+	Team       string     `json:"team"`
+	Position   [3]float32 `json:"position"`
+	ViewAngles [2]float32 `json:"view_angles"`
+	AimTarget  [3]float32 `json:"aim_target"`
+}
+
+type RoundStartPositions map[string][]PlayerStartPosition
 
 func initializePlayerInRound(player *common.Player, roundPurchases *RoundPurchaseData) {
 	if player == nil || roundPurchases == nil {
@@ -317,6 +333,7 @@ func Start(filePath string) {
 	playerLastScopedState = make(map[uint64]bool)
 	recentPickups = make(map[TickPlayer]int)
 	purchasedThisTick = make(map[TickPlayer]int64)
+	allRoundsStartPositions = make(RoundStartPositions)
 
 	var (
 		roundNum     = 0
@@ -339,6 +356,15 @@ func Start(filePath string) {
 
 		if gs.IsWarmupPeriod() || currentRound == nil {
 			return
+		}
+
+		if recordMode == "late_start" {
+			if currentRound.recordStartTick == -1 {
+				return
+			}
+			if currentTick < currentRound.recordStartTick {
+				return
+			}
 		}
 
 		Players := getAllPlayers(gs)
@@ -705,6 +731,14 @@ func Start(filePath string) {
 		tickRate := iParser.TickRate()
 		dropDelayTicks := int(tickRate * 1.0)
 
+		var recordStartTick int
+		if recordMode == "late_start" {
+			recordStartTick = -1
+			ilog.InfoLogger.Printf("  录制模式: late_start, 将在冻结结束前 %.1f 秒开始录制", lateStartOffset)
+		} else {
+			recordStartTick = currentTick
+		}
+
 		currentRound = &RoundInfo{
 			roundNum:        roundNum,
 			freezetimeStart: currentTick,
@@ -713,6 +747,7 @@ func Start(filePath string) {
 			isHalftime:      false,
 			started:         true,
 			dropAllowedTick: currentTick + dropDelayTicks,
+			recordStartTick: recordStartTick,
 		}
 
 		currentRoundPurchases = &RoundPurchaseData{
@@ -752,10 +787,22 @@ func Start(filePath string) {
 			currentRound.inFreezeTime = false
 
 			tickRate := iParser.TickRate()
+
+			if recordMode == "late_start" {
+				offsetTicks := int(tickRate * lateStartOffset)
+				currentRound.recordStartTick = currentTick - offsetTicks
+				ilog.InfoLogger.Printf("  录制将从tick %d开始（冻结结束前 %.1f 秒）",
+					currentRound.recordStartTick, lateStartOffset)
+			}
+
 			extendTicks := int(tickRate * 20)
 			currentRound.buyTimeEnd = currentTick + extendTicks
 
 			ilog.InfoLogger.Printf("回合 %d 冻结时间结束", currentRound.roundNum)
+
+			if recordMode == "late_start" {
+				recordRoundStartPositions(&gs, currentRound.roundNum)
+			}
 
 			recordPlayersGrenades(&gs, currentRoundPurchases)
 			recordPlayerSpawns(&gs, currentRound.roundNum)
@@ -948,6 +995,15 @@ func Start(filePath string) {
 	} else {
 		ilog.InfoLogger.Printf("出生点数据已保存到: %s/spawns.json", outputBaseDir)
 		ilog.InfoLogger.Printf("共记录 %d 个回合的出生点", len(allRoundsSpawns))
+	}
+
+	ilog.InfoLogger.Println("\n开始保存录制开始位置数据...")
+	err = saveRecordStartPositions()
+	if err != nil {
+		ilog.ErrorLogger.Printf("保存录制开始位置失败: %s\n", err.Error())
+	} else if recordMode == "late_start" {
+		ilog.InfoLogger.Printf("录制开始位置已保存到: %s/record_start_positions.json", outputBaseDir)
+		ilog.InfoLogger.Printf("共记录 %d 个回合的开始位置", len(allRoundsStartPositions))
 	}
 
 	ilog.InfoLogger.Printf("\n解析完成!所有回合录像已保存到 %s/ 目录", outputBaseDir)
@@ -1265,4 +1321,72 @@ func encodeDropButton(slot int) int32 {
 	}
 
 	return int32(uint32(IN_DROP) | (uint32(slotEncoded) << 27))
+}
+
+// 记录回合开始录制时的位置
+func recordRoundStartPositions(gs *dem.GameState, roundNum int) {
+	allPlayers := getAllPlayers(*gs)
+	positions := make([]PlayerStartPosition, 0, len(allPlayers))
+
+	for _, player := range allPlayers {
+		if player == nil || !player.IsAlive() {
+			continue
+		}
+
+		pos := player.Position()
+		teamName := ""
+		switch player.Team {
+		case common.TeamTerrorists:
+			teamName = "T"
+		case common.TeamCounterTerrorists:
+			teamName = "CT"
+		default:
+			continue
+		}
+
+		// 获取准星瞄准点
+		aimTarget := getPlayerAimTarget(player)
+
+		startPos := PlayerStartPosition{
+			PlayerName: player.Name,
+			Team:       teamName,
+			Position:   [3]float32{float32(pos.X), float32(pos.Y), float32(pos.Z)},
+			ViewAngles: [2]float32{float32(player.ViewDirectionY()), float32(player.ViewDirectionX())},
+			AimTarget:  aimTarget,
+		}
+
+		positions = append(positions, startPos)
+	}
+
+	roundKey := fmt.Sprintf("round%d", roundNum)
+	allRoundsStartPositions[roundKey] = positions
+
+	ilog.InfoLogger.Printf("  记录了 %d 个玩家的录制开始位置和准星坐标", len(positions))
+}
+
+// 保存录制开始位置数据
+func saveRecordStartPositions() error {
+	if recordMode != "late_start" {
+		return nil
+	}
+
+	startPosFile := filepath.Join(outputBaseDir, "record_start_positions.json")
+
+	roundKeys := make([]string, 0, len(allRoundsStartPositions))
+	for key := range allRoundsStartPositions {
+		roundKeys = append(roundKeys, key)
+	}
+	sort.Strings(roundKeys)
+
+	orderedData := make(map[string][]PlayerStartPosition)
+	for _, key := range roundKeys {
+		orderedData[key] = allRoundsStartPositions[key]
+	}
+
+	data, err := json.MarshalIndent(orderedData, "", "  ")
+	if err != nil {
+		return fmt.Errorf("JSON序列化失败: %w", err)
+	}
+
+	return os.WriteFile(startPosFile, data, 0644)
 }

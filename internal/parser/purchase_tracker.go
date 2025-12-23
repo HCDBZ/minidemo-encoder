@@ -428,7 +428,7 @@ func getFinalInventory(player *common.Player) []string {
 	}
 
 	inventory := []string{}
-	weaponsSeen := make(map[string]bool, 10)
+	weaponsSeen := make(map[string]int, 10)
 
 	for _, weapon := range player.Weapons() {
 		if weapon == nil {
@@ -436,25 +436,40 @@ func getFinalInventory(player *common.Player) []string {
 		}
 
 		weaponName := getEquipmentName(weapon)
-		if weaponName != "" && !shouldFilterFromInventory(weaponName) && !weaponsSeen[weaponName] {
-			inventory = append(inventory, weaponName)
-			weaponsSeen[weaponName] = true
+		if weaponName == "" || shouldFilterFromInventory(weaponName) {
+			continue
+		}
+
+		// 闪光弹允许最多2个
+		if weaponName == "flashbang" {
+			if weaponsSeen["flashbang"] < 2 {
+				inventory = append(inventory, weaponName)
+				weaponsSeen["flashbang"]++
+			}
+		} else {
+			// 其他武器去重
+			if weaponsSeen[weaponName] == 0 {
+				inventory = append(inventory, weaponName)
+				weaponsSeen[weaponName] = 1
+			}
 		}
 	}
 
+	// 护甲检查
 	if player.HasHelmet() {
-		if !weaponsSeen["vesthelm"] {
+		if weaponsSeen["vesthelm"] == 0 {
 			inventory = append(inventory, "vesthelm")
-			weaponsSeen["vesthelm"] = true
+			weaponsSeen["vesthelm"] = 1
 		}
 	} else if player.Armor() > 0 {
-		if !weaponsSeen["vest"] {
+		if weaponsSeen["vest"] == 0 {
 			inventory = append(inventory, "vest")
-			weaponsSeen["vest"] = true
+			weaponsSeen["vest"] = 1
 		}
 	}
 
-	if player.HasDefuseKit() && !weaponsSeen["defuser"] {
+	// 拆弹器
+	if player.HasDefuseKit() && weaponsSeen["defuser"] == 0 {
 		inventory = append(inventory, "defuser")
 	}
 
@@ -502,6 +517,10 @@ func optimizeInitialInventory(playerData *PlayerPurchaseData) []string {
 }
 
 func savePurchaseData(data AllRoundsPurchaseData) error {
+	if recordMode == "late_start" {
+		return savePurchaseDataOptimized(data)
+	}
+
 	if err := savePurchaseDataRaw(data); err != nil {
 		return err
 	}
@@ -534,6 +553,10 @@ func savePurchaseDataRaw(data AllRoundsPurchaseData) error {
 
 func savePurchaseDataOptimized(data AllRoundsPurchaseData) error {
 	outputFile := filepath.Join(outputBaseDir, "purchases.json")
+
+	if recordMode == "late_start" {
+		return savePurchaseDataSimplified(data)
+	}
 
 	orderedData := make(map[string]*RoundPurchaseData)
 	roundNums := extractAndSortRounds(data)
@@ -581,6 +604,41 @@ func savePurchaseDataOptimized(data AllRoundsPurchaseData) error {
 	return nil
 }
 
+func savePurchaseDataSimplified(data AllRoundsPurchaseData) error {
+	outputFile := filepath.Join(outputBaseDir, "purchases.json")
+
+	simplified := make(map[string]map[string]map[string][]string)
+
+	roundNums := extractAndSortRounds(data)
+	for _, num := range roundNums {
+		key := fmt.Sprintf("round%d", num)
+		simplified[key] = map[string]map[string][]string{
+			"T":  make(map[string][]string),
+			"CT": make(map[string][]string),
+		}
+
+		for playerName, playerData := range data[key].T {
+			simplified[key]["T"][playerName] = playerData.InitialInventory
+		}
+
+		for playerName, playerData := range data[key].CT {
+			simplified[key]["CT"][playerName] = playerData.InitialInventory
+		}
+	}
+
+	jsonData, err := json.MarshalIndent(simplified, "", "  ")
+	if err != nil {
+		return fmt.Errorf("JSON序列化失败: %w", err)
+	}
+
+	if err := os.WriteFile(outputFile, jsonData, 0644); err != nil {
+		return fmt.Errorf("写入文件失败: %w", err)
+	}
+
+	ilog.InfoLogger.Printf("购买数据已保存: %s", outputFile)
+	return nil
+}
+
 func extractAndSortRounds(data AllRoundsPurchaseData) []int {
 	roundNums := make([]int, 0, len(data))
 	for key := range data {
@@ -602,4 +660,175 @@ func orderRoundData(data AllRoundsPurchaseData) map[string]*RoundPurchaseData {
 	}
 
 	return orderedData
+}
+
+// 处理buyTime期间的购买
+func processBuyTimeInventory(weaponName string, currentInventory []string) (bool, []string) {
+	// 过滤掉默认装备
+	if shouldFilterWeapon(weaponName) {
+		return false, currentInventory
+	}
+
+	// 统计当前装备情况
+	hasPrimary := false
+	hasAWP := false
+	primaryIndex := -1
+	pistolIndex := -1
+
+	for i, item := range currentInventory {
+		if isPrimaryWeapon(item) {
+			hasPrimary = true
+			primaryIndex = i
+			if item == "awp" {
+				hasAWP = true
+			}
+		}
+		if isSecondaryPistol(item) {
+			pistolIndex = i
+		}
+	}
+
+	// 处理主武器购买
+	if isPrimaryWeapon(weaponName) {
+		if hasPrimary {
+			// 替换现有主武器
+			newInventory := make([]string, 0, len(currentInventory))
+			for i, item := range currentInventory {
+				if i != primaryIndex {
+					newInventory = append(newInventory, item)
+				}
+			}
+			newInventory = append(newInventory, weaponName)
+			return true, newInventory
+		}
+		// 没有主武器，直接添加
+		return true, append(currentInventory, weaponName)
+	}
+
+	// 处理手枪购买
+	if isSecondaryPistol(weaponName) {
+		// 没有主武器，可以买手枪
+		if !hasPrimary {
+			if pistolIndex >= 0 {
+				// 替换现有手枪
+				newInventory := make([]string, 0, len(currentInventory))
+				for i, item := range currentInventory {
+					if i != pistolIndex {
+						newInventory = append(newInventory, item)
+					}
+				}
+				newInventory = append(newInventory, weaponName)
+				return true, newInventory
+			}
+			// 没有手枪，直接添加
+			return true, append(currentInventory, weaponName)
+		}
+
+		// 主武器是AWP，可以买手枪
+		if hasAWP {
+			if pistolIndex >= 0 {
+				// 替换现有手枪
+				newInventory := make([]string, 0, len(currentInventory))
+				for i, item := range currentInventory {
+					if i != pistolIndex {
+						newInventory = append(newInventory, item)
+					}
+				}
+				newInventory = append(newInventory, weaponName)
+				return true, newInventory
+			}
+			// 没有手枪，直接添加
+			return true, append(currentInventory, weaponName)
+		}
+
+		// 非AWP主武器，不买手枪
+		return false, currentInventory
+	}
+
+	// 处理投掷物
+	if isGrenadeWeapon(weaponName) {
+		grenadeCount := make(map[string]int)
+		totalGrenades := 0
+
+		for _, item := range currentInventory {
+			if isGrenadeWeapon(item) {
+				grenadeCount[item]++
+				totalGrenades++
+			}
+		}
+
+		// 总数限制：4个
+		if totalGrenades >= 4 {
+			return false, currentInventory
+		}
+
+		// 闪光限制：2个
+		if weaponName == "flashbang" {
+			if grenadeCount["flashbang"] >= 2 {
+				return false, currentInventory
+			}
+			return true, append(currentInventory, weaponName)
+		}
+
+		// 其他投掷物限制：1个
+		if grenadeCount[weaponName] >= 1 {
+			return false, currentInventory
+		}
+
+		return true, append(currentInventory, weaponName)
+	}
+
+	// 处理护甲
+	if weaponName == "vest" || weaponName == "vesthelm" {
+		// 移除旧护甲，添加新护甲
+		newInventory := make([]string, 0, len(currentInventory))
+		for _, item := range currentInventory {
+			if item != "vest" && item != "vesthelm" {
+				newInventory = append(newInventory, item)
+			}
+		}
+		newInventory = append(newInventory, weaponName)
+		return true, newInventory
+	}
+
+	// 处理拆弹器和Zeus
+	if weaponName == "defuser" || weaponName == "taser" {
+		// 检查是否已有
+		for _, item := range currentInventory {
+			if item == weaponName {
+				return false, currentInventory
+			}
+		}
+		return true, append(currentInventory, weaponName)
+	}
+
+	// 其他装备直接添加
+	return true, append(currentInventory, weaponName)
+}
+
+// isSecondaryPistol 判断是否为副手枪（非默认手枪）
+func isSecondaryPistol(weaponName string) bool {
+	secondaryPistols := map[string]bool{
+		"p250":     true,
+		"deagle":   true,
+		"fn57":     true,
+		"tec9":     true,
+		"cz75a":    true,
+		"revolver": true,
+		"elite":    true,
+	}
+	return secondaryPistols[weaponName]
+}
+
+// isGrenadeWeapon 判断是否为投掷物
+func isGrenadeWeapon(weaponName string) bool {
+	grenades := map[string]bool{
+		"flashbang":    true,
+		"smokegrenade": true,
+		"hegrenade":    true,
+		"molotov":      true,
+		"incgrenade":   true,
+		"decoy":        true,
+	}
+	return grenades[weaponName]
 }

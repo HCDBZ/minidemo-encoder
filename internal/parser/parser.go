@@ -451,7 +451,32 @@ func Start(filePath string) {
 			}
 		}
 
-		// 购买系统记录
+		// late_start：只在 buyTimeEnd 期间补充缺失装备
+		if recordMode == "late_start" && currentRound != nil && !currentRound.inFreezeTime {
+			if isPurchase && currentTick <= currentRound.buyTimeEnd {
+				var teamMap map[string]*PlayerPurchaseData
+				if e.Player.Team == common.TeamTerrorists {
+					teamMap = currentRoundPurchases.T
+				} else if e.Player.Team == common.TeamCounterTerrorists {
+					teamMap = currentRoundPurchases.CT
+				}
+
+				if teamMap != nil {
+					playerName := e.Player.Name
+					if playerData, exists := teamMap[playerName]; exists {
+						processed, newInventory := processBuyTimeInventory(weaponName, playerData.InitialInventory)
+						if processed {
+							playerData.InitialInventory = newInventory
+							ilog.InfoLogger.Printf("  [更新] %s: %s -> %v",
+								playerName, weaponName, newInventory)
+						}
+					}
+				}
+			}
+			return
+		}
+
+		// full购买记录逻辑
 		if currentRound != nil && currentRound.inFreezeTime && !shouldFilterWeapon(weaponName) {
 			if isPurchase || isPickup {
 				dropTime := getAdjustedTime(currentTick-currentRound.freezetimeStart, iParser.TickRate())
@@ -525,11 +550,37 @@ func Start(filePath string) {
 			return
 		}
 
-		// 仅冻结时间购买追踪
-		if currentRound != nil && currentRound.inFreezeTime && !shouldFilterWeapon(weaponName) {
-			// 检查是否为新武器（RegisterDrop之前）
-			isNewWeapon := weaponTracker.IsNewWeapon(e.Weapon)
+		// late_start：只追踪武器状态
+		if recordMode == "late_start" {
+			weaponTracker.RegisterDrop(e.Weapon, steamID)
 
+			// 生成丢弃按键
+			if e.Player.IsAlive() {
+				key := TickPlayer{currentTick, steamID}
+				droppedWeaponSlot := getWeaponSlot(weaponType)
+
+				isAutoReplace := false
+				if pickedSlot, exists := recentPickups[key]; exists {
+					if pickedSlot == droppedWeaponSlot {
+						isAutoReplace = true
+					}
+				}
+
+				if !isAutoReplace {
+					dropButton := encodeDropButton(droppedWeaponSlot)
+					if existingButtons, ok := buttonTickMap[key]; ok {
+						buttonTickMap[key] = existingButtons | dropButton
+					} else {
+						buttonTickMap[key] = dropButton
+					}
+				}
+			}
+			return
+		}
+
+		// full购买追踪逻辑
+		if currentRound != nil && currentRound.inFreezeTime && !shouldFilterWeapon(weaponName) {
+			isNewWeapon := weaponTracker.IsNewWeapon(e.Weapon)
 			weaponTracker.RegisterDrop(e.Weapon, steamID)
 
 			dropTime := getAdjustedTime(currentTick-currentRound.freezetimeStart, iParser.TickRate())
@@ -552,7 +603,6 @@ func Start(filePath string) {
 					}
 				}
 
-				// 判断是否为购买丢弃
 				action := ActionDrop
 				if isNewWeapon && e.Player.IsInBuyZone() {
 					action = ActionBuyDrop
@@ -568,14 +618,11 @@ func Start(filePath string) {
 			}
 		}
 
-		// 丢弃类型的判断
-
-		// 检查是否生成按键
+		// 丢弃按键生成
 		if e.Player.IsAlive() {
 			key := TickPlayer{currentTick, steamID}
 			droppedWeaponSlot := getWeaponSlot(weaponType)
 
-			// 检查同一tick是否拾取了同槽位武器（自动替换）
 			isAutoReplace := false
 			if pickedSlot, exists := recentPickups[key]; exists {
 				if pickedSlot == droppedWeaponSlot {
@@ -583,7 +630,6 @@ func Start(filePath string) {
 				}
 			}
 
-			// 检查是否为购买丢弃（Ctrl+购买）
 			isBuyDrop := false
 			if !isAutoReplace && weaponTracker.IsNewWeapon(e.Weapon) {
 				if e.Player.IsInBuyZone() && currentRound != nil {
@@ -593,10 +639,8 @@ func Start(filePath string) {
 				}
 			}
 
-			// 只有手动丢弃才生成按键
 			if !isAutoReplace && !isBuyDrop {
 				dropButton := encodeDropButton(droppedWeaponSlot)
-
 				if existingButtons, ok := buttonTickMap[key]; ok {
 					buttonTickMap[key] = existingButtons | dropButton
 				} else {
@@ -790,19 +834,34 @@ func Start(filePath string) {
 
 				Players := getAllPlayers(gs)
 				trimmedCount := 0
+
+				// 记录冻结结束时的装备作为基础
 				for _, player := range Players {
 					if player == nil {
 						continue
 					}
 
+					// 裁剪帧数据
 					frames := encoder.PlayerFramesMap[player.Name]
-					if len(frames) == 0 {
-						continue
-					}
-
 					if len(frames) > offsetTicks {
 						encoder.PlayerFramesMap[player.Name] = frames[len(frames)-offsetTicks:]
 						trimmedCount++
+					}
+
+					// 记录冻结结束时的最终装备
+					var teamMap map[string]*PlayerPurchaseData
+					if player.Team == common.TeamTerrorists {
+						teamMap = currentRoundPurchases.T
+					} else if player.Team == common.TeamCounterTerrorists {
+						teamMap = currentRoundPurchases.CT
+					}
+
+					if teamMap != nil {
+						teamMap[player.Name] = &PlayerPurchaseData{
+							InitialInventory:      getFinalInventory(player),
+							Purchases:             []PurchaseRecord{},
+							FreezetimeEndGrenades: []string{},
+						}
 					}
 				}
 
@@ -820,7 +879,10 @@ func Start(filePath string) {
 				recordRoundStartPositions(&gs, currentRound.roundNum)
 			}
 
-			recordPlayersGrenades(&gs, currentRoundPurchases)
+			if recordMode != "late_start" {
+				recordPlayersGrenades(&gs, currentRoundPurchases)
+			}
+
 			recordPlayerSpawns(&gs, currentRound.roundNum)
 			detectC4Holder(&gs, currentRound.roundNum)
 		}
@@ -842,21 +904,26 @@ func Start(filePath string) {
 		}
 
 		currentRound.roundEnd = currentTick
-		freezeDuration := getAdjustedTime(currentRound.freezetimeEnd-currentRound.freezetimeStart, iParser.TickRate())
+
+		if recordMode != "late_start" {
+			freezeDuration := getAdjustedTime(currentRound.freezetimeEnd-currentRound.freezetimeStart, iParser.TickRate())
+
+			if currentRound.isHalftime {
+				freezeInfo := fmt.Sprintf("HALFTIME:%d", currentRound.roundNum)
+				allRoundsFreezeInfo = append(allRoundsFreezeInfo, freezeInfo)
+			} else {
+				freezeInfo := fmt.Sprintf("round%d: %.2f秒", currentRound.roundNum, freezeDuration)
+				allRoundsFreezeInfo = append(allRoundsFreezeInfo, freezeInfo)
+				allFreezeDurations = append(allFreezeDurations, freezeDuration)
+			}
+		}
 
 		ilog.InfoLogger.Printf("回合 %d 结束", currentRound.roundNum)
 
-		if currentRound.isHalftime {
-			freezeInfo := fmt.Sprintf("HALFTIME:%d", currentRound.roundNum)
-			allRoundsFreezeInfo = append(allRoundsFreezeInfo, freezeInfo)
-		} else {
-			freezeInfo := fmt.Sprintf("round%d: %.2f秒", currentRound.roundNum, freezeDuration)
-			allRoundsFreezeInfo = append(allRoundsFreezeInfo, freezeInfo)
-			allFreezeDurations = append(allFreezeDurations, freezeDuration)
-		}
-
+		// 金钱调整
 		adjustMoneyForInitialInventory(currentRoundPurchases, currentRound.roundNum)
 
+		// 保存录像
 		Players := getAllPlayers(gs)
 		savedCount := 0
 		for _, player := range Players {

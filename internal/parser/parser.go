@@ -117,7 +117,6 @@ type PlayerStartPosition struct {
 	PlayerName string     `json:"player_name"`
 	Team       string     `json:"team"`
 	Position   [3]float32 `json:"position"`
-	ViewAngles [2]float32 `json:"view_angles"`
 	AimTarget  [3]float32 `json:"aim_target"`
 }
 
@@ -359,10 +358,7 @@ func Start(filePath string) {
 		}
 
 		if recordMode == "late_start" {
-			if currentRound.recordStartTick == -1 {
-				return
-			}
-			if currentTick < currentRound.recordStartTick {
+			if currentTick < currentRound.freezetimeStart {
 				return
 			}
 		}
@@ -733,8 +729,8 @@ func Start(filePath string) {
 
 		var recordStartTick int
 		if recordMode == "late_start" {
-			recordStartTick = -1
-			ilog.InfoLogger.Printf("  录制模式: late_start, 将在冻结结束前 %.1f 秒开始录制", lateStartOffset)
+			recordStartTick = currentTick
+			ilog.InfoLogger.Printf("  录制模式: late_start, 将在冻结结束时精确裁剪到前 %.1f 秒", lateStartOffset)
 		} else {
 			recordStartTick = currentTick
 		}
@@ -790,9 +786,29 @@ func Start(filePath string) {
 
 			if recordMode == "late_start" {
 				offsetTicks := int(tickRate * lateStartOffset)
-				currentRound.recordStartTick = currentTick - offsetTicks
-				ilog.InfoLogger.Printf("  录制将从tick %d开始（冻结结束前 %.1f 秒）",
-					currentRound.recordStartTick, lateStartOffset)
+				actualStartTick := currentTick - offsetTicks
+
+				Players := getAllPlayers(gs)
+				trimmedCount := 0
+				for _, player := range Players {
+					if player == nil {
+						continue
+					}
+
+					frames := encoder.PlayerFramesMap[player.Name]
+					if len(frames) == 0 {
+						continue
+					}
+
+					if len(frames) > offsetTicks {
+						encoder.PlayerFramesMap[player.Name] = frames[len(frames)-offsetTicks:]
+						trimmedCount++
+					}
+				}
+
+				currentRound.recordStartTick = actualStartTick
+				ilog.InfoLogger.Printf("  精确裁剪完成: 保留冻结结束前 %.1f 秒的数据 (%d ticks, %d 名玩家)",
+					lateStartOffset, offsetTicks, trimmedCount)
 			}
 
 			extendTicks := int(tickRate * 20)
@@ -883,6 +899,10 @@ func Start(filePath string) {
 		gs := iParser.GameState()
 
 		if gs.IsWarmupPeriod() {
+			return
+		}
+
+		if recordMode == "late_start" {
 			return
 		}
 
@@ -979,22 +999,26 @@ func Start(filePath string) {
 		ilog.InfoLogger.Printf("玩家信息已保存到: %s/players_info.json", outputBaseDir)
 	}
 
-	ilog.InfoLogger.Println("\n开始保存聊天数据...")
-	err = saveChatData()
-	if err != nil {
-		ilog.ErrorLogger.Printf("保存聊天数据失败: %s\n", err.Error())
-	} else {
-		ilog.InfoLogger.Printf("聊天数据已保存到: %s/chat.json", outputBaseDir)
-		ilog.InfoLogger.Printf("共记录 %d 条聊天消息", len(allChatMessages))
+	if recordMode != "late_start" {
+		ilog.InfoLogger.Println("\n开始保存聊天数据...")
+		err = saveChatData()
+		if err != nil {
+			ilog.ErrorLogger.Printf("保存聊天数据失败: %s\n", err.Error())
+		} else {
+			ilog.InfoLogger.Printf("聊天数据已保存到: %s/chat.json", outputBaseDir)
+			ilog.InfoLogger.Printf("共记录 %d 条聊天消息", len(allChatMessages))
+		}
 	}
 
-	ilog.InfoLogger.Println("\n开始保存出生点数据...")
-	err = saveSpawnData()
-	if err != nil {
-		ilog.ErrorLogger.Printf("保存出生点数据失败: %s\n", err.Error())
-	} else {
-		ilog.InfoLogger.Printf("出生点数据已保存到: %s/spawns.json", outputBaseDir)
-		ilog.InfoLogger.Printf("共记录 %d 个回合的出生点", len(allRoundsSpawns))
+	if recordMode != "late_start" {
+		ilog.InfoLogger.Println("\n开始保存出生点数据...")
+		err = saveSpawnData()
+		if err != nil {
+			ilog.ErrorLogger.Printf("保存出生点数据失败: %s\n", err.Error())
+		} else {
+			ilog.InfoLogger.Printf("出生点数据已保存到: %s/spawns.json", outputBaseDir)
+			ilog.InfoLogger.Printf("共记录 %d 个回合的出生点", len(allRoundsSpawns))
+		}
 	}
 
 	ilog.InfoLogger.Println("\n开始保存录制开始位置数据...")
@@ -1005,12 +1029,14 @@ func Start(filePath string) {
 		ilog.InfoLogger.Printf("录制开始位置已保存到: %s/record_start_positions.json", outputBaseDir)
 		ilog.InfoLogger.Printf("共记录 %d 个回合的开始位置", len(allRoundsStartPositions))
 	}
-
-	ilog.InfoLogger.Printf("\n解析完成!所有回合录像已保存到 %s/ 目录", outputBaseDir)
-	ilog.InfoLogger.Printf("共解析 %d 个回合\n", roundNum)
 }
 
 func saveFreezeTimeInfo() {
+	if recordMode == "late_start" {
+		ilog.InfoLogger.Println("\nlate_start 模式: 跳过冻结时间信息保存")
+		return
+	}
+
 	mostCommonFreeze := getMostCommonFreezeDuration()
 
 	for i, info := range allRoundsFreezeInfo {
@@ -1239,6 +1265,10 @@ func recordPlayersGrenades(gs *dem.GameState, roundPurchases *RoundPurchaseData)
 }
 
 func recordPlayerSpawns(gs *dem.GameState, roundNum int) {
+	if recordMode == "late_start" {
+		return
+	}
+
 	allPlayers := getAllPlayers(*gs)
 
 	spawns := make([]SpawnPosition, 0, len(allPlayers))
@@ -1351,7 +1381,6 @@ func recordRoundStartPositions(gs *dem.GameState, roundNum int) {
 			PlayerName: player.Name,
 			Team:       teamName,
 			Position:   [3]float32{float32(pos.X), float32(pos.Y), float32(pos.Z)},
-			ViewAngles: [2]float32{float32(player.ViewDirectionY()), float32(player.ViewDirectionX())},
 			AimTarget:  aimTarget,
 		}
 

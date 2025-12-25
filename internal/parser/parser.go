@@ -108,19 +108,7 @@ var (
 	purchasedThisTick map[TickPlayer]int64
 	recordMode        string  = "late_start" // late_start full
 	lateStartOffset   float64 = 1.0
-
-	allRoundsStartPositions RoundStartPositions
 )
-
-// 录制开始位置数据
-type PlayerStartPosition struct {
-	PlayerName string     `json:"player_name"`
-	Team       string     `json:"team"`
-	Position   [3]float32 `json:"position"`
-	AimTarget  [3]float32 `json:"aim_target"`
-}
-
-type RoundStartPositions map[string][]PlayerStartPosition
 
 func initializePlayerInRound(player *common.Player, roundPurchases *RoundPurchaseData) {
 	if player == nil || roundPurchases == nil {
@@ -332,7 +320,6 @@ func Start(filePath string) {
 	playerLastScopedState = make(map[uint64]bool)
 	recentPickups = make(map[TickPlayer]int)
 	purchasedThisTick = make(map[TickPlayer]int64)
-	allRoundsStartPositions = make(RoundStartPositions)
 
 	var (
 		roundNum     = 0
@@ -875,10 +862,6 @@ func Start(filePath string) {
 
 			ilog.InfoLogger.Printf("回合 %d 冻结时间结束", currentRound.roundNum)
 
-			if recordMode == "late_start" {
-				recordRoundStartPositions(&gs, currentRound.roundNum)
-			}
-
 			if recordMode != "late_start" {
 				recordPlayersGrenades(&gs, currentRoundPurchases)
 			}
@@ -1077,24 +1060,13 @@ func Start(filePath string) {
 		}
 	}
 
-	if recordMode != "late_start" {
-		ilog.InfoLogger.Println("\n开始保存出生点数据...")
-		err = saveSpawnData()
-		if err != nil {
-			ilog.ErrorLogger.Printf("保存出生点数据失败: %s\n", err.Error())
-		} else {
-			ilog.InfoLogger.Printf("出生点数据已保存到: %s/spawns.json", outputBaseDir)
-			ilog.InfoLogger.Printf("共记录 %d 个回合的出生点", len(allRoundsSpawns))
-		}
-	}
-
-	ilog.InfoLogger.Println("\n开始保存录制开始位置数据...")
-	err = saveRecordStartPositions()
+	ilog.InfoLogger.Println("\n开始保存出生点数据...")
+	err = saveSpawnData()
 	if err != nil {
-		ilog.ErrorLogger.Printf("保存录制开始位置失败: %s\n", err.Error())
-	} else if recordMode == "late_start" {
-		ilog.InfoLogger.Printf("录制开始位置已保存到: %s/record_start_positions.json", outputBaseDir)
-		ilog.InfoLogger.Printf("共记录 %d 个回合的开始位置", len(allRoundsStartPositions))
+		ilog.ErrorLogger.Printf("保存出生点数据失败: %s\n", err.Error())
+	} else {
+		ilog.InfoLogger.Printf("出生点数据已保存到: %s/spawns.json", outputBaseDir)
+		ilog.InfoLogger.Printf("共记录 %d 个回合的出生点", len(allRoundsSpawns))
 	}
 }
 
@@ -1332,10 +1304,6 @@ func recordPlayersGrenades(gs *dem.GameState, roundPurchases *RoundPurchaseData)
 }
 
 func recordPlayerSpawns(gs *dem.GameState, roundNum int) {
-	if recordMode == "late_start" {
-		return
-	}
-
 	allPlayers := getAllPlayers(*gs)
 
 	spawns := make([]SpawnPosition, 0, len(allPlayers))
@@ -1418,71 +1386,4 @@ func encodeDropButton(slot int) int32 {
 	}
 
 	return int32(uint32(IN_DROP) | (uint32(slotEncoded) << 27))
-}
-
-// 记录回合开始录制时的位置
-func recordRoundStartPositions(gs *dem.GameState, roundNum int) {
-	allPlayers := getAllPlayers(*gs)
-	positions := make([]PlayerStartPosition, 0, len(allPlayers))
-
-	for _, player := range allPlayers {
-		if player == nil || !player.IsAlive() {
-			continue
-		}
-
-		pos := player.Position()
-		teamName := ""
-		switch player.Team {
-		case common.TeamTerrorists:
-			teamName = "T"
-		case common.TeamCounterTerrorists:
-			teamName = "CT"
-		default:
-			continue
-		}
-
-		// 获取准星瞄准点
-		aimTarget := getPlayerAimTarget(player)
-
-		startPos := PlayerStartPosition{
-			PlayerName: player.Name,
-			Team:       teamName,
-			Position:   [3]float32{float32(pos.X), float32(pos.Y), float32(pos.Z)},
-			AimTarget:  aimTarget,
-		}
-
-		positions = append(positions, startPos)
-	}
-
-	roundKey := fmt.Sprintf("round%d", roundNum)
-	allRoundsStartPositions[roundKey] = positions
-
-	ilog.InfoLogger.Printf("  记录了 %d 个玩家的录制开始位置和准星坐标", len(positions))
-}
-
-// 保存录制开始位置数据
-func saveRecordStartPositions() error {
-	if recordMode != "late_start" {
-		return nil
-	}
-
-	startPosFile := filepath.Join(outputBaseDir, "record_start_positions.json")
-
-	roundKeys := make([]string, 0, len(allRoundsStartPositions))
-	for key := range allRoundsStartPositions {
-		roundKeys = append(roundKeys, key)
-	}
-	sort.Strings(roundKeys)
-
-	orderedData := make(map[string][]PlayerStartPosition)
-	for _, key := range roundKeys {
-		orderedData[key] = allRoundsStartPositions[key]
-	}
-
-	data, err := json.MarshalIndent(orderedData, "", "  ")
-	if err != nil {
-		return fmt.Errorf("JSON序列化失败: %w", err)
-	}
-
-	return os.WriteFile(startPosFile, data, 0644)
 }
